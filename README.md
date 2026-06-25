@@ -1,24 +1,218 @@
-# cqrs
+# Factos
 
-[![Package Version](https://img.shields.io/hexpm/v/cqrs)](https://hex.pm/packages/cqrs)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/cqrs/)
+Prototype context-first event-sourcing helpers for Gleam and KurrentDB.
 
-```sh
-gleam add cqrs@1
-```
+This package deliberately does not model Event Sourcing as aggregates. A command
+capability reads the facts relevant to one decision, folds a temporary decision
+model, decides which new facts to record, and records them only when the relevant
+context can be protected.
+
+## Opinion
+
+Event Sourcing is the persistence idea: accepted facts are the authoritative
+state of the system. Aggregates, CQRS, projections, message brokers, and stream
+versioning are implementation choices.
+
+This prototype follows the shape described by Command Context Consistency and
+Dynamic Consistency Boundaries:
+
+1. A command defines the context it needs.
+2. The context is expressed as a query over event types and tags.
+3. The application folds only those facts into a decision model.
+4. The application produces new facts.
+5. The store must reject the append if matching facts appeared after the context
+   was observed.
+
+That last step requires store support. KurrentDB's normal append API supports
+expected stream revision checks. That is useful, but it is not the same as a
+DCB-style query-conditioned append.
+
+## Domain Model
+
+Keep commands, events, state, decisions, evolution, and errors in your app.
+
 ```gleam
-import cqrs
+pub type Command {
+  RegisterUser(username: String)
+}
 
-pub fn main() -> Nil {
-  // TODO: An example of the project in use
+pub type Event {
+  UsernameReserved(username: String)
+  UserRegistered(username: String)
+}
+
+pub type UsernameState {
+  UsernameAvailable
+  UsernameTaken
+}
+
+pub type DomainError {
+  UsernameAlreadyTaken
+}
+
+pub fn evolve(state: UsernameState, event: Event) -> UsernameState {
+  case state, event {
+    UsernameAvailable, UsernameReserved(_) -> UsernameTaken
+    UsernameAvailable, UserRegistered(_) -> UsernameTaken
+    UsernameTaken, UsernameReserved(_) -> state
+    UsernameTaken, UserRegistered(_) -> state
+  }
+}
+
+pub fn decide(state: UsernameState, command: Command) {
+  case state, command {
+    UsernameAvailable, RegisterUser(username) -> Ok([UserRegistered(username)])
+    UsernameTaken, RegisterUser(_) -> Error(UsernameAlreadyTaken)
+  }
 }
 ```
 
-Further documentation can be found at <https://hexdocs.pm/cqrs>.
+## Command Context
+
+The command context is not a `User` aggregate. It is the facts relevant to the
+decision: has this username been reserved or registered?
+
+```gleam
+import factos
+
+pub fn username_context(username: String) -> factos.Query {
+  factos.query([
+    factos.query_item(
+      types: [
+        factos.event_type("UsernameReserved"),
+        factos.event_type("UserRegistered"),
+      ],
+      tags: [factos.tag("username:" <> username)],
+    ),
+  ])
+}
+```
+
+Query items are OR-combined. Within one item, event types are OR-combined and
+tags are AND-combined.
+
+## Tags
+
+Tags are an explicit query contract. If a future command needs to select events
+by username, account, invoice number, or product, that value must be exposed as a
+tag when the event is written.
+
+```gleam
+factos.tag("username:renata")
+factos.tag("account:abc123")
+```
+
+This is intentionally opinionated. Tags duplicate selected payload information,
+but they make consistency and query needs visible at the event-store boundary.
+
+## Codecs
+
+The app owns encoding and decoding. The codec returns both the domain event and
+the event-store metadata needed by the context API.
+
+```gleam
+pub fn codec() -> factos.EventCodec(Event, DecodeError) {
+  factos.EventCodec(encode: encode, decode: decode_event)
+}
+```
+
+`encode` returns a `factos.Proposed` with the domain event, event type, tags, and
+the KurrentDB append message. `decode` returns a `factos.Decoded` with the domain
+event, event type, and tags read from the stored event.
+
+The library does not force one JSON shape for tags. In a real app, store tags in
+custom metadata or payload fields consistently, and decode them at the boundary.
+
+## Reading A Context
+
+```gleam
+factos.read_context(
+  connection,
+  query: username_context("renata"),
+  initial: UsernameAvailable,
+  evolve: evolve,
+  codec: codec(),
+  timeout: 5000,
+)
+```
+
+`read_context` reads from `$all`, applies a server-side event-type filter when
+possible, decodes events, filters them by the full query, folds state, and
+returns a `factos.Context`.
+
+The returned context includes:
+
+1. The folded decision state.
+2. The matching recorded events.
+3. The highest observed sequence position.
+4. A DCB-style append condition: `FailIfEventsMatch(query, after: position)`.
+
+## Appending
+
+The ideal append condition is:
+
+```gleam
+factos.FailIfEventsMatch(query, after: position)
+```
+
+That means: append these new facts only if no facts matching the command context
+appeared after the position used for the decision.
+
+This prototype models that condition, but the current KurrentDB-backed append
+function returns `UnsupportedAppendCondition` for it because regular KurrentDB
+append checks stream revisions, not arbitrary event-type/tag queries.
+
+```gleam
+factos.append_with_condition(
+  connection,
+  stream: "facts",
+  events: events,
+  codec: codec(),
+  condition: context.append_condition,
+  timeout: 5000,
+)
+```
+
+Use this shape for stores that support DCB-style atomic append conditions.
+
+## Stream Consistency
+
+KurrentDB can safely protect a single stream with expected revision checks. This
+is still useful when a stream is the right consistency boundary.
+
+```gleam
+factos.dispatch_stream(
+  connection,
+  stream: "user-renata",
+  initial: UsernameAvailable,
+  decide: decide,
+  evolve: evolve,
+  codec: codec(),
+  command: RegisterUser("renata"),
+  timeout: 5000,
+)
+```
+
+This is aggregate-stream style consistency. It is not the definition of Event
+Sourcing, and it may over-conflict when unrelated events share the same stream.
+
+## KurrentDB Tradeoffs
+
+KurrentDB support available through the current dependency:
+
+1. Read a single stream.
+2. Append to a stream with `NoStream`, `Revision(n)`, `StreamExists`, or `Any`.
+3. Read `$all` with event-type or stream-name filters.
+
+Newer KurrentDB versions also support secondary and user-defined indexes that
+can be consumed through `$all` stream-prefix filters such as `$idx-et-...` or
+`$idx-user-...`. Those improve reads, but the docs describe secondary indexes as
+eventually consistent. They should not be treated as a command-decision
+consistency guarantee unless the write path can atomically enforce the same
+condition.
 
 ## Development
 
 ```sh
-gleam run   # Run the project
-gleam test  # Run the tests
+gleam test
 ```
