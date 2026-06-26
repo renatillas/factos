@@ -33,6 +33,7 @@ pub type Proposed(event) {
   Proposed(
     event: event,
     type_: factos.EventType,
+    version: Int,
     tags: List(factos.Tag),
     metadata: factos.Metadata,
     message: append_to_stream.Event,
@@ -541,13 +542,14 @@ fn decode_recorded(
     |> result.map_error(DecodeError),
   )
 
-  let factos.Decoded(event, type_, tags, metadata) = decoded
+  let factos.Decoded(event, type_, version, tags, metadata) = decoded
   Ok(factos.Recorded(
     id: uuid.to_string(recorded_event.id),
     stream: recorded_event.stream,
     revision: recorded_event.revision,
     position: factos.SequencePosition(recorded_event.commit_position),
     type_: type_,
+    version: version,
     tags: tags,
     metadata: metadata,
     event: event,

@@ -34,6 +34,7 @@ pub type Proposed(event) {
     id: String,
     event: event,
     type_: factos.EventType,
+    version: Int,
     tags: List(factos.Tag),
     metadata: factos.Metadata,
     data: BitArray,
@@ -52,6 +53,7 @@ pub type StoredEvent {
     stream: String,
     revision: Int,
     type_: factos.EventType,
+    version: Int,
     tags: List(factos.Tag),
     metadata: factos.Metadata,
     data: BitArray,
@@ -108,6 +110,7 @@ pub fn migrate(connection: sqlight.Connection) -> Result(Nil, Error(_, _)) {
       stream text not null,
       revision integer not null,
       type text not null,
+      version integer not null,
       tags text not null,
       metadata text not null default '',
       data blob not null,
@@ -373,12 +376,12 @@ fn insert_events(
     [] -> Ok(Append(current_revision: revision - 1, position: position))
     [event, ..rest] -> {
       let EventCodec(encode, _) = codec
-      let Proposed(id, _, type_, tags, metadata, data) = encode(event)
+      let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
       use positions <- result.try(
         sqlight.query(
           "
-          insert into factos_events (id, stream, revision, type, tags, metadata, data)
-          values (?, ?, ?, ?, ?, ?, ?)
+          insert into factos_events (id, stream, revision, type, version, tags, metadata, data)
+          values (?, ?, ?, ?, ?, ?, ?, ?)
           returning position
           ",
           on: connection,
@@ -387,6 +390,7 @@ fn insert_events(
             sqlight.text(stream_name),
             sqlight.int(revision),
             sqlight.text(factos.event_type_name(type_)),
+            sqlight.int(version),
             sqlight.text(tags_to_text(tags)),
             sqlight.text(metadata_to_text(metadata)),
             sqlight.blob(data),
@@ -418,7 +422,7 @@ fn read_matching_events(
 ) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
   use rows <- result.try(
     sqlight.query(
-      "select position, id, stream, revision, type, tags, metadata, data from factos_events order by position",
+      "select position, id, stream, revision, type, version, tags, metadata, data from factos_events order by position",
       on: connection,
       with: [],
       expecting: stored_event_decoder(),
@@ -436,7 +440,7 @@ fn read_stream_events(
 ) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
   use rows <- result.try(
     sqlight.query(
-      "select position, id, stream, revision, type, tags, metadata, data from factos_events where stream = ? order by revision",
+      "select position, id, stream, revision, type, version, tags, metadata, data from factos_events where stream = ? order by revision",
       on: connection,
       with: [sqlight.text(stream_name)],
       expecting: stored_event_decoder(),
@@ -466,8 +470,8 @@ fn decode_row(
 ) -> Result(factos.Recorded(event), Error(domain_error, decode_error)) {
   let EventCodec(_, decode_event) = codec
   use decoded <- result.try(decode_event(row) |> result.map_error(DecodeError))
-  let factos.Decoded(event, type_, tags, metadata) = decoded
-  let StoredEvent(position, id, stream, revision, _, _, _, _) = row
+  let factos.Decoded(event, type_, version, tags, metadata) = decoded
+  let StoredEvent(position, id, stream, revision, _, _, _, _, _) = row
 
   Ok(factos.Recorded(
     id: id,
@@ -475,6 +479,7 @@ fn decode_row(
     revision: revision,
     position: factos.SequencePosition(position),
     type_: type_,
+    version: version,
     tags: tags,
     metadata: metadata,
     event: event,
@@ -487,15 +492,17 @@ fn stored_event_decoder() -> decode.Decoder(StoredEvent) {
   use stream <- decode.field(2, decode.string)
   use revision <- decode.field(3, decode.int)
   use type_name <- decode.field(4, decode.string)
-  use tags <- decode.field(5, decode.string)
-  use metadata <- decode.field(6, decode.string)
-  use data <- decode.field(7, decode.bit_array)
+  use version <- decode.field(5, decode.int)
+  use tags <- decode.field(6, decode.string)
+  use metadata <- decode.field(7, decode.string)
+  use data <- decode.field(8, decode.bit_array)
   decode.success(StoredEvent(
     position: position,
     id: id,
     stream: stream,
     revision: revision,
     type_: factos.event_type(type_name),
+    version: version,
     tags: tags_from_text(tags),
     metadata: metadata_from_text(metadata),
     data: data,
@@ -567,6 +574,7 @@ fn matches_query_parts(
       revision: 0,
       position: factos.NoPosition,
       type_: type_,
+      version: 1,
       tags: tags,
       metadata: factos.empty_metadata(),
       event: Nil,

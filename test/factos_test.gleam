@@ -238,6 +238,7 @@ fn recorded(
     revision: revision,
     position: factos.SequencePosition(revision),
     type_: type_,
+    version: 1,
     tags: tags,
     metadata: factos.empty_metadata(),
     event: event,

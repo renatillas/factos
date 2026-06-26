@@ -31,6 +31,7 @@ pub type Proposed(event) {
     id: String,
     event: event,
     type_: factos.EventType,
+    version: Int,
     tags: List(factos.Tag),
     metadata: factos.Metadata,
     data: String,
@@ -45,6 +46,7 @@ pub type StoredEvent {
     stream: String,
     revision: Int,
     type_: factos.EventType,
+    version: Int,
     tags: List(factos.Tag),
     metadata: factos.Metadata,
     data: String,
@@ -102,6 +104,7 @@ pub fn migrate(database: d1.Database) -> Promise(Result(Nil, Error(_, _))) {
       stream text not null,
       revision integer not null,
       type text not null,
+      version integer not null,
       tags text not null,
       metadata text not null,
       data text not null,
@@ -329,7 +332,7 @@ fn read_matching_events(
 ) {
   d1.prepare(
     database,
-    "select position, id, stream, revision, type, tags, metadata, data from factos_events order by position",
+    "select position, id, stream, revision, type, version, tags, metadata, data from factos_events order by position",
   )
   |> d1.raw
   |> promise.map(fn(result) {
@@ -348,7 +351,7 @@ fn read_stream_events(
 ) {
   d1.prepare(
     database,
-    "select position, id, stream, revision, type, tags, metadata, data from factos_events where stream = ? order by revision",
+    "select position, id, stream, revision, type, version, tags, metadata, data from factos_events where stream = ? order by revision",
   )
   |> d1.bind([stream_name])
   |> d1.raw
@@ -395,8 +398,8 @@ fn decode_row(
   use decoded <- result.try(
     decode_event(stored) |> result.map_error(DecodeError),
   )
-  let factos.Decoded(event, type_, tags, metadata) = decoded
-  let StoredEvent(position, id, stream, revision, _, _, _, _) = stored
+  let factos.Decoded(event, type_, version, tags, metadata) = decoded
+  let StoredEvent(position, id, stream, revision, _, _, _, _, _) = stored
 
   Ok(factos.Recorded(
     id: id,
@@ -404,6 +407,7 @@ fn decode_row(
     revision: revision,
     position: factos.SequencePosition(position),
     type_: type_,
+    version: version,
     tags: tags,
     metadata: metadata,
     event: event,
@@ -418,9 +422,10 @@ fn decode_stored_event(
   use stream <- result.try(decode_string_field(row, 2))
   use revision <- result.try(decode_int_field(row, 3))
   use type_name <- result.try(decode_string_field(row, 4))
-  use tags <- result.try(decode_string_field(row, 5))
-  use metadata <- result.try(decode_string_field(row, 6))
-  use data <- result.try(decode_string_field(row, 7))
+  use version <- result.try(decode_int_field(row, 5))
+  use tags <- result.try(decode_string_field(row, 6))
+  use metadata <- result.try(decode_string_field(row, 7))
+  use data <- result.try(decode_string_field(row, 8))
 
   Ok(StoredEvent(
     position: position,
@@ -428,6 +433,7 @@ fn decode_stored_event(
     stream: stream,
     revision: revision,
     type_: factos.event_type(type_name),
+    version: version,
     tags: tags_from_text(tags),
     metadata: metadata_from_text(metadata),
     data: data,
@@ -483,7 +489,7 @@ fn append_sql(
     })
 
   let sql =
-    "insert into factos_events (id, stream, revision, type, tags, metadata, data) "
+    "insert into factos_events (id, stream, revision, type, version, tags, metadata, data) "
     <> string.join(list.map(rows, fn(row) { row.0 }), with: " union all ")
     <> " returning position, revision"
 
@@ -499,13 +505,14 @@ fn append_select_sql(
   index: Int,
 ) -> #(String, List(String)) {
   let EventCodec(encode, _) = codec
-  let Proposed(id, _, type_, tags, metadata, data) = encode(event)
+  let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
   let base_values = [
     id,
     stream_name,
     stream_name,
     int.to_string(index + 1),
     factos.event_type_name(type_),
+    int.to_string(version),
     tags_to_text(tags),
     metadata_to_text(metadata),
     data,
@@ -513,7 +520,7 @@ fn append_select_sql(
 
   let #(condition, condition_values) = append_condition_sql(stream_name, mode)
   #(
-    "select ?, ?, (select coalesce(max(revision), -1) from factos_events where stream = ?) + cast(? as integer), ?, ?, ?, ? where "
+    "select ?, ?, (select coalesce(max(revision), -1) from factos_events where stream = ?) + cast(? as integer), ?, cast(? as integer), ?, ?, ? where "
       <> condition,
     list.append(base_values, condition_values),
   )

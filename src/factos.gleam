@@ -137,7 +137,13 @@ pub type Decoded(event) {
   /// Backends use codecs supplied by the application. The decoded value includes
   /// the domain event plus the event type and tags that should participate in
   /// query matching, along with non-query event metadata.
-  Decoded(event: event, type_: EventType, tags: List(Tag), metadata: Metadata)
+  Decoded(
+    event: event,
+    type_: EventType,
+    version: Int,
+    tags: List(Tag),
+    metadata: Metadata,
+  )
 }
 
 pub type Recorded(event) {
@@ -152,6 +158,7 @@ pub type Recorded(event) {
     revision: Int,
     position: SequencePosition,
     type_: EventType,
+    version: Int,
     tags: List(Tag),
     metadata: Metadata,
     event: event,

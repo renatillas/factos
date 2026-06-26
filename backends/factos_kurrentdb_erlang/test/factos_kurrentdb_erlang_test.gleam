@@ -205,6 +205,7 @@ fn encode_counter_event(
       factos_kurrentdb_erlang.Proposed(
         event: event,
         type_: factos.event_type(event_type),
+        version: 1,
         tags: [factos.tag("counter:load")],
         metadata: factos.empty_metadata(),
         message: append_to_stream.binary_event(
@@ -233,6 +234,7 @@ fn decode_counter_event(
       Ok(factos.Decoded(
         event: Incremented(value),
         type_: factos.event_type(event_type),
+        version: 1,
         tags: [factos.tag("counter:load")],
         metadata: factos.empty_metadata(),
       ))

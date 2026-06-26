@@ -145,6 +145,7 @@ fn encode(event: Event) -> factos_sqlight.Proposed(Event) {
     id: "event-" <> event.username,
     event: event,
     type_: factos.event_type("UserRegistered"),
+    version: 1,
     tags: [factos.tag("username:" <> event.username)],
     metadata: factos.empty_metadata(),
     data: bit_array.from_string(event.username),
@@ -163,6 +164,7 @@ fn decode(
       Ok(factos.Decoded(
         event: UserRegistered(username),
         type_: stored.type_,
+        version: stored.version,
         tags: stored.tags,
         metadata: stored.metadata,
       ))
@@ -284,6 +286,7 @@ fn encode_counter_event(
         id: "counter-event-" <> int.to_string(value),
         event: event,
         type_: factos.event_type("Incremented"),
+        version: 1,
         tags: [factos.tag("counter:load")],
         metadata: factos.empty_metadata(),
         data: bit_array.from_string(int.to_string(value)),
@@ -307,6 +310,7 @@ fn decode_counter_event(
       Ok(factos.Decoded(
         event: Incremented(value),
         type_: stored.type_,
+        version: stored.version,
         tags: stored.tags,
         metadata: stored.metadata,
       ))

@@ -701,6 +701,7 @@ fn proposed(
     id: "example-" <> type_name <> "-" <> fields_to_payload(fields),
     event: event,
     type_: factos.event_type(type_name),
+    version: 1,
     tags: [factos.tag("restaurant"), ..tags],
     metadata: factos.empty_metadata(),
     data: bit_array.from_string(fields_to_payload(fields)),
@@ -721,6 +722,7 @@ fn decode_event(
   Ok(factos.Decoded(
     event: event,
     type_: stored.type_,
+    version: stored.version,
     tags: stored.tags,
     metadata: stored.metadata,
   ))

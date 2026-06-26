@@ -286,6 +286,7 @@ fn encode(event: Event) -> backend.Proposed(Event) {
         id: "event-" <> name,
         event: event,
         type_: factos.event_type("reserved"),
+        version: 1,
         tags: [factos.tag("name:" <> name)],
         metadata: factos.empty_metadata(),
         data: name,
@@ -301,6 +302,7 @@ fn decode(
       Ok(factos.Decoded(
         event: Reserved(stored.data),
         type_: stored.type_,
+        version: stored.version,
         tags: stored.tags,
         metadata: stored.metadata,
       ))

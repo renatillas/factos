@@ -282,6 +282,7 @@ fn encode_event(event: Event) -> factos_pog.Proposed(Event) {
         id: "ticket-sold-" <> buyer,
         event: event,
         type_: factos.event_type("TicketSold"),
+        version: 1,
         tags: [factos.tag("event:" <> event_id)],
         metadata: factos.empty_metadata(),
         data: bit_array.from_string(buyer),
@@ -301,6 +302,7 @@ fn decode_event(
       Ok(factos.Decoded(
         event: TicketSold(buyer),
         type_: stored.type_,
+        version: stored.version,
         tags: stored.tags,
         metadata: stored.metadata,
       ))
