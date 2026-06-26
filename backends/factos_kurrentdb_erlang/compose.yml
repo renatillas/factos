@@ -1,0 +1,28 @@
+services:
+  kurrentdb:
+    image: docker.kurrent.io/kurrent-latest/kurrentdb:latest
+    environment:
+      - KURRENTDB_CLUSTER_SIZE=1
+      - KURRENTDB_RUN_PROJECTIONS=All
+      - KURRENTDB_START_STANDARD_PROJECTIONS=true
+      - KURRENTDB_NODE_PORT=2113
+      - KURRENTDB_INSECURE=false
+      - KURRENTDB_ALLOW_ANONYMOUS_ENDPOINT_ACCESS=true
+      - KURRENTDB_ALLOW_ANONYMOUS_STREAM_ACCESS=true
+      - KURRENTDB_ENABLE_ATOM_PUB_OVER_HTTP=true
+      - KURRENTDB_CERTIFICATE_FILE=/certs/node.crt
+      - KURRENTDB_CERTIFICATE_PRIVATE_KEY_FILE=/certs/node.key
+      - KURRENTDB_TRUSTED_ROOT_CERTIFICATES_PATH=/certs/trusted
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "2113:2113"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail --cacert /certs/ca.crt https://localhost:2113/health/live || exit 1",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30

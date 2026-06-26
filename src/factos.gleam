@@ -1,23 +1,13 @@
-//// Context-first event-sourcing helpers for Gleam and KurrentDB.
+//// Store-independent event-sourcing domain primitives.
 ////
-//// Event Sourcing does not require aggregates. A command capability should read
-//// the facts relevant to its decision, fold a temporary decision model, decide
-//// which new facts to record, and then record those facts only when the relevant
-//// context is still stable. This module models that API directly.
-////
-//// KurrentDB's regular append API can guarantee stream revision consistency. It
-//// cannot, through the operations used here, atomically guarantee a DCB-style
-//// "fail if events matching this query were appended after position X" check.
-//// The API keeps those concepts separate instead of pretending they are the same.
+//// Factos keeps the domain model in the application. The core module models
+//// facts, command contexts, pure decision components, and pure views. Concrete
+//// storage concerns live in backend packages such as `factos_sqlight` and
+//// `factos_kurrentdb_erlang`.
 
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import kurrentdb/operation/append_to_stream
-import kurrentdb/operation/read_all
-import kurrentdb/operation/read_stream
-import kurrentdb_erlang
-import youid/uuid.{type Uuid}
 
 pub type EventType {
   EventType(String)
@@ -38,7 +28,7 @@ pub type QueryItem {
 
 pub type SequencePosition {
   NoPosition
-  SequencePosition(commit_position: Int, prepare_position: Int)
+  SequencePosition(Int)
 }
 
 pub type AppendCondition {
@@ -67,32 +57,12 @@ pub type Decoded(event) {
   Decoded(event: event, type_: EventType, tags: List(Tag))
 }
 
-pub type Proposed(event) {
-  Proposed(
-    event: event,
-    type_: EventType,
-    tags: List(Tag),
-    message: append_to_stream.Event,
-  )
-}
-
-pub type EventCodec(event, decode_error) {
-  EventCodec(
-    encode: fn(event) -> Proposed(event),
-    decode: fn(read_stream.RecordedEvent) ->
-      Result(Decoded(event), decode_error),
-  )
-}
-
 pub type Recorded(event) {
   Recorded(
-    id: Uuid,
+    id: String,
     stream: String,
     revision: Int,
     position: SequencePosition,
-    metadata: List(#(String, String)),
-    custom_metadata: BitArray,
-    data: BitArray,
     type_: EventType,
     tags: List(Tag),
     event: event,
@@ -118,21 +88,22 @@ pub type LoadedStream(event, state) {
   )
 }
 
-pub type Error(domain_error, decode_error) {
-  DomainError(domain_error)
-  DecodeError(decode_error)
-  ReadError(kurrentdb_erlang.Error(read_stream.ResponseError))
-  AppendError(kurrentdb_erlang.Error(append_to_stream.ResponseError))
-  ReadTimedOut
-  UnsupportedAppendCondition(AppendCondition)
-}
-
 pub fn event_type(name: String) -> EventType {
   EventType(name)
 }
 
+pub fn event_type_name(event_type: EventType) -> String {
+  let EventType(name) = event_type
+  name
+}
+
 pub fn tag(value: String) -> Tag {
   Tag(value)
+}
+
+pub fn tag_value(tag: Tag) -> String {
+  let Tag(value) = tag
+  value
 }
 
 pub fn query(items: List(QueryItem)) -> Query {
@@ -188,6 +159,15 @@ pub fn compute_state(
   Ok(fold_events(state, events, evolve))
 }
 
+pub fn evolve_recorded(
+  initial initial: state,
+  events events: List(Recorded(event)),
+  evolve evolve: fn(state, event) -> state,
+) -> state {
+  use state, recorded <- list.fold(events, initial)
+  evolve(state, recorded.event)
+}
+
 pub fn project(
   view view: View(state, event),
   events events: List(event),
@@ -217,211 +197,14 @@ pub fn merge_views(
   #(first_evolve(first_state, event), second_evolve(second_state, event))
 }
 
-pub fn read_context(
-  connection: kurrentdb_erlang.Connection,
-  query query: Query,
-  decider decider: Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-  timeout timeout: Int,
-) -> Result(Context(event, state), Error(domain_error, decode_error)) {
-  let Decider(initial, _, evolve) = decider
-
-  read_context_events(connection, query, initial, evolve, codec, timeout)
-}
-
 pub fn decide_context(
   context: Context(event, state),
   command: command,
   decider: Decider(command, state, event, domain_error),
-) -> Result(
-  #(Context(event, state), List(event)),
-  Error(domain_error, decode_error),
-) {
+) -> Result(#(Context(event, state), List(event)), domain_error) {
   let Decider(_, decide, _) = decider
-  use events <- result.try(
-    decide(context.state, command)
-    |> result.map_error(DomainError),
-  )
-
+  use events <- result.try(decide(context.state, command))
   Ok(#(context, events))
-}
-
-pub fn dispatch_context(
-  connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  query query: Query,
-  decider decider: Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-  command command: command,
-  timeout timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  use context <- result.try(read_context(
-    connection,
-    query: query,
-    decider: decider,
-    codec: codec,
-    timeout: timeout,
-  ))
-  use pair <- result.try(decide_context(context, command, decider))
-  let #(context, events) = pair
-
-  append_with_condition(
-    connection,
-    stream_name,
-    events,
-    codec,
-    context.append_condition,
-    timeout,
-  )
-}
-
-fn append_with_condition(
-  connection: kurrentdb_erlang.Connection,
-  stream_name: String,
-  events: List(event),
-  codec: EventCodec(event, decode_error),
-  condition: AppendCondition,
-  timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  case condition {
-    NoAppendCondition ->
-      append_to_stream_with_config(
-        connection,
-        stream_name,
-        events,
-        codec,
-        append_to_stream.configure() |> append_to_stream.any,
-        timeout,
-      )
-    FailIfEventsMatch(_, _) -> Error(UnsupportedAppendCondition(condition))
-  }
-}
-
-fn read_context_events(
-  connection: kurrentdb_erlang.Connection,
-  query: Query,
-  initial: state,
-  evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  timeout: Int,
-) -> Result(Context(event, state), Error(domain_error, decode_error)) {
-  let stream =
-    kurrentdb_erlang.read_all(
-      connection,
-      config: read_all.configure()
-        |> read_all.filter(query_to_read_all_filter(query)),
-    )
-
-  receive_context(
-    stream,
-    query,
-    initial,
-    evolve,
-    codec,
-    [],
-    NoPosition,
-    timeout,
-  )
-}
-
-fn load_stream_events(
-  connection: kurrentdb_erlang.Connection,
-  stream_name: String,
-  initial: state,
-  evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  timeout: Int,
-) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
-  let stream =
-    kurrentdb_erlang.read_stream(
-      connection,
-      stream: stream_name,
-      config: read_stream.configure(),
-    )
-
-  receive_stream(
-    stream,
-    stream_name,
-    initial,
-    evolve,
-    codec,
-    [],
-    NoEvents,
-    timeout,
-  )
-}
-
-pub fn load_stream(
-  connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  decider decider: Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-  timeout timeout: Int,
-) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
-  let Decider(initial, _, evolve) = decider
-
-  load_stream_events(connection, stream_name, initial, evolve, codec, timeout)
-}
-
-pub fn dispatch_stream(
-  connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  decider decider: Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-  command command: command,
-  timeout timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  let Decider(initial, decide, evolve) = decider
-
-  use loaded <- result.try(load_stream_events(
-    connection,
-    stream_name,
-    initial,
-    evolve,
-    codec,
-    timeout,
-  ))
-
-  use events <- result.try(
-    decide(loaded.state, command)
-    |> result.map_error(DomainError),
-  )
-
-  append_stream_events(
-    connection,
-    stream_name,
-    events,
-    codec,
-    loaded.revision,
-    timeout,
-  )
-}
-
-fn append_stream_events(
-  connection: kurrentdb_erlang.Connection,
-  stream_name: String,
-  events: List(event),
-  codec: EventCodec(event, decode_error),
-  expected: Revision,
-  timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  append_to_stream_with_config(
-    connection,
-    stream_name,
-    events,
-    codec,
-    append_config(expected),
-    timeout,
-  )
-}
-
-fn fold_events(
-  initial: state,
-  events: List(event),
-  evolve: fn(state, event) -> state,
-) -> state {
-  use state, event <- list.fold(events, initial)
-  evolve(state, event)
 }
 
 pub fn matches_query(recorded: Recorded(event), query: Query) -> Bool {
@@ -438,336 +221,21 @@ pub fn highest_position(
   case left, right {
     NoPosition, position -> position
     position, NoPosition -> position
-    SequencePosition(left_commit, left_prepare),
-      SequencePosition(right_commit, right_prepare)
-    ->
-      case
-        left_commit > right_commit
-        || { left_commit == right_commit && left_prepare >= right_prepare }
-      {
-        True -> left
-        False -> right
+    SequencePosition(left), SequencePosition(right) ->
+      case left >= right {
+        True -> SequencePosition(left)
+        False -> SequencePosition(right)
       }
   }
 }
 
-fn append_to_stream_with_config(
-  connection: kurrentdb_erlang.Connection,
-  stream_name: String,
+fn fold_events(
+  initial: state,
   events: List(event),
-  codec: EventCodec(event, decode_error),
-  config: append_to_stream.Configuration,
-  timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  case events {
-    [] ->
-      Ok(append_to_stream.Append(
-        current_revision: -1,
-        position: append_to_stream.NoPositionReturned,
-      ))
-    [_, ..] -> {
-      let EventCodec(encode, _) = codec
-      let task =
-        kurrentdb_erlang.append_to_stream(
-          connection,
-          stream: stream_name,
-          events: list.map(events, fn(event) {
-            let Proposed(message: message, ..) = encode(event)
-            message
-          }),
-          config: config,
-        )
-
-      kurrentdb_erlang.await(task, within: timeout)
-      |> result.map_error(AppendError)
-    }
-  }
-}
-
-fn receive_context(
-  stream: kurrentdb_erlang.Stream,
-  query: Query,
-  state: state,
   evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  events: List(Recorded(event)),
-  position: SequencePosition,
-  timeout: Int,
-) -> Result(Context(event, state), Error(domain_error, decode_error)) {
-  case kurrentdb_erlang.receive(stream, within: timeout) {
-    Error(Nil) -> {
-      kurrentdb_erlang.close(stream)
-      Error(ReadTimedOut)
-    }
-    Ok(kurrentdb_erlang.StreamFinished) -> {
-      kurrentdb_erlang.close(stream)
-      Ok(Context(
-        query:,
-        state:,
-        events: list.reverse(events),
-        position:,
-        append_condition: FailIfEventsMatch(query, position),
-      ))
-    }
-    Ok(kurrentdb_erlang.StreamFailed(error)) -> {
-      kurrentdb_erlang.close(stream)
-      Error(ReadError(error))
-    }
-    Ok(kurrentdb_erlang.ReadEvent(event)) ->
-      receive_context_event(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        position,
-        timeout,
-        event,
-      )
-    Ok(kurrentdb_erlang.ReadMessage(read_stream.ReadEvent(event))) ->
-      receive_context_event(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        position,
-        timeout,
-        event,
-      )
-    Ok(kurrentdb_erlang.ReadMessage(read_stream.LastAllStreamPosition(read_stream.Position(
-      commit_position: commit_position,
-      prepare_position: prepare_position,
-    )))) ->
-      receive_context(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        highest_position(
-          position,
-          SequencePosition(commit_position, prepare_position),
-        ),
-        timeout,
-      )
-    Ok(kurrentdb_erlang.ReadMessage(_)) ->
-      receive_context(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        position,
-        timeout,
-      )
-  }
-}
-
-fn receive_context_event(
-  stream: kurrentdb_erlang.Stream,
-  query: Query,
-  state: state,
-  evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  events: List(Recorded(event)),
-  position: SequencePosition,
-  timeout: Int,
-  read_event: read_stream.ReadEvent,
-) -> Result(Context(event, state), Error(domain_error, decode_error)) {
-  use recorded <- result.try(decode_recorded(read_event, codec))
-  let next_position = highest_position(position, recorded.position)
-
-  case matches_query(recorded, query) {
-    True ->
-      receive_context(
-        stream,
-        query,
-        evolve(state, recorded.event),
-        evolve,
-        codec,
-        [recorded, ..events],
-        next_position,
-        timeout,
-      )
-    False ->
-      receive_context(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        next_position,
-        timeout,
-      )
-  }
-}
-
-fn receive_stream(
-  stream: kurrentdb_erlang.Stream,
-  stream_name: String,
-  state: state,
-  evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  events: List(Recorded(event)),
-  revision: Revision,
-  timeout: Int,
-) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
-  case kurrentdb_erlang.receive(stream, within: timeout) {
-    Error(Nil) -> {
-      kurrentdb_erlang.close(stream)
-      Error(ReadTimedOut)
-    }
-    Ok(kurrentdb_erlang.StreamFinished) -> {
-      kurrentdb_erlang.close(stream)
-      Ok(LoadedStream(
-        stream: stream_name,
-        state:,
-        events: list.reverse(events),
-        revision:,
-      ))
-    }
-    Ok(kurrentdb_erlang.StreamFailed(error)) -> {
-      kurrentdb_erlang.close(stream)
-      case error {
-        kurrentdb_erlang.OperationError(read_stream.ReadStreamNotFound(_)) ->
-          Ok(LoadedStream(
-            stream: stream_name,
-            state:,
-            events: [],
-            revision: NoEvents,
-          ))
-        _ -> Error(ReadError(error))
-      }
-    }
-    Ok(kurrentdb_erlang.ReadEvent(event)) ->
-      receive_stream_event(
-        stream,
-        stream_name,
-        state,
-        evolve,
-        codec,
-        events,
-        timeout,
-        event,
-      )
-    Ok(kurrentdb_erlang.ReadMessage(read_stream.ReadEvent(event))) ->
-      receive_stream_event(
-        stream,
-        stream_name,
-        state,
-        evolve,
-        codec,
-        events,
-        timeout,
-        event,
-      )
-    Ok(kurrentdb_erlang.ReadMessage(_)) ->
-      receive_stream(
-        stream,
-        stream_name,
-        state,
-        evolve,
-        codec,
-        events,
-        revision,
-        timeout,
-      )
-  }
-}
-
-fn receive_stream_event(
-  stream: kurrentdb_erlang.Stream,
-  stream_name: String,
-  state: state,
-  evolve: fn(state, event) -> state,
-  codec: EventCodec(event, decode_error),
-  events: List(Recorded(event)),
-  timeout: Int,
-  read_event: read_stream.ReadEvent,
-) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
-  use recorded <- result.try(decode_recorded(read_event, codec))
-
-  receive_stream(
-    stream,
-    stream_name,
-    evolve(state, recorded.event),
-    evolve,
-    codec,
-    [recorded, ..events],
-    CurrentRevision(recorded.revision),
-    timeout,
-  )
-}
-
-fn decode_recorded(
-  read_event: read_stream.ReadEvent,
-  codec: EventCodec(event, decode_error),
-) -> Result(Recorded(event), Error(domain_error, decode_error)) {
-  let EventCodec(_, decode) = codec
-  use decoded <- result.try(
-    decode(read_event.event)
-    |> result.map_error(DecodeError),
-  )
-
-  let Decoded(event, type_, tags) = decoded
-  Ok(Recorded(
-    id: read_event.event.id,
-    stream: read_event.event.stream,
-    revision: read_event.event.revision,
-    position: SequencePosition(
-      read_event.event.commit_position,
-      read_event.event.prepare_position,
-    ),
-    metadata: read_event.event.metadata,
-    custom_metadata: read_event.event.custom_metadata,
-    data: read_event.event.data,
-    type_: type_,
-    tags: tags,
-    event: event,
-  ))
-}
-
-fn query_to_read_all_filter(query: Query) -> read_all.Filter {
-  let types = query_event_type_names(query)
-
-  case types {
-    [] -> read_all.NoFilter
-    [_, ..] -> read_all.EventTypePrefix(types, window: read_all.FilterMax(1000))
-  }
-}
-
-fn query_event_type_names(query: Query) -> List(String) {
-  case query {
-    AllEvents -> []
-    Query(items) -> collect_type_names(items, [])
-  }
-}
-
-fn collect_type_names(
-  items: List(QueryItem),
-  names: List(String),
-) -> List(String) {
-  case items {
-    [] -> list.reverse(names)
-    [QueryItem(types, _), ..rest] ->
-      collect_type_names(rest, prepend_type_names(types, names))
-  }
-}
-
-fn prepend_type_names(
-  types: List(EventType),
-  names: List(String),
-) -> List(String) {
-  case types {
-    [] -> names
-    [EventType(name), ..rest] -> prepend_type_names(rest, [name, ..names])
-  }
+) -> state {
+  use state, event <- list.fold(events, initial)
+  evolve(state, event)
 }
 
 fn matches_item(recorded: Recorded(event), item: QueryItem) -> Bool {
@@ -793,14 +261,5 @@ fn matches_tags(event_tags: List(Tag), required_tags: List(Tag)) -> Bool {
       use tag <- list.any(event_tags)
       tag == required
     }
-  }
-}
-
-fn append_config(revision: Revision) -> append_to_stream.Configuration {
-  case revision {
-    NoEvents -> append_to_stream.configure() |> append_to_stream.no_stream
-    CurrentRevision(revision) ->
-      append_to_stream.configure()
-      |> append_to_stream.expected_revision(revision)
   }
 }

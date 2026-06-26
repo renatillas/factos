@@ -2,7 +2,6 @@ import factos
 import gleam/int
 import gleam/option.{None, Some}
 import gleeunit
-import youid/uuid
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -106,8 +105,8 @@ pub fn empty_query_matches_all_events_test() {
 }
 
 pub fn highest_position_keeps_later_position_test() {
-  let early = factos.SequencePosition(commit_position: 10, prepare_position: 10)
-  let later = factos.SequencePosition(commit_position: 11, prepare_position: 0)
+  let early = factos.SequencePosition(10)
+  let later = factos.SequencePosition(11)
 
   assert factos.highest_position(early, later) == later
   assert factos.highest_position(factos.NoPosition, early) == early
@@ -234,16 +233,10 @@ fn recorded(
   }
 
   factos.Recorded(
-    id: uuid.v7(),
+    id: "event-" <> int.to_string(revision),
     stream: "user-1",
     revision: revision,
-    position: factos.SequencePosition(
-      commit_position: revision,
-      prepare_position: revision,
-    ),
-    metadata: [],
-    custom_metadata: <<>>,
-    data: <<>>,
+    position: factos.SequencePosition(revision),
     type_: type_,
     tags: tags,
     event: event,

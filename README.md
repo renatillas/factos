@@ -1,6 +1,6 @@
 # Factos
 
-Prototype context-first event-sourcing helpers for Gleam and KurrentDB.
+Prototype context-first event-sourcing helpers for Gleam.
 
 This package deliberately does not model Event Sourcing as aggregates. A command
 capability reads the facts relevant to one decision, folds a temporary decision
@@ -79,7 +79,7 @@ pub fn registration_decider() {
 
 `Decider` is inspired by FModel: it is a small pure domain component made from
 three things only: initial state, a decision function, and an evolution function.
-It does not know about KurrentDB, projections, subscriptions, HTTP, retries, or
+It does not know about SQLite, KurrentDB, projections, subscriptions, HTTP, retries, or
 repositories.
 
 You can test a decider without any storage:
@@ -130,39 +130,70 @@ factos.tag("account:abc123")
 This is intentionally opinionated. Tags duplicate selected payload information,
 but they make consistency and query needs visible at the event-store boundary.
 
+## Backends
+
+Factos is split into a small core package and backend packages:
+
+1. `factos` contains the store-independent domain primitives: `Decider`, `View`, `Query`, `Tag`, `Recorded`, and `Context`.
+2. `backends/factos_sqlight` provides module `factos/sqlight` for SQLite via the `sqlight` package.
+3. `backends/factos_kurrentdb_erlang` provides module `factos/kurrentdb` for KurrentDB on Erlang.
+
+Backends own their storage codecs and storage errors. The core package does not depend on either SQLite or KurrentDB.
+
 ## Codecs
 
-The app owns encoding and decoding. The codec returns both the domain event and
-the event-store metadata needed by the context API.
+The app owns encoding and decoding. Backend codecs return both the domain event
+and the event-store metadata needed by the context API.
 
 ```gleam
-pub fn codec() -> factos.EventCodec(Event, DecodeError) {
-  factos.EventCodec(encode: encode, decode: decode_event)
+import factos/sqlight as factos_sqlight
+import sqlight
+
+pub fn codec() -> factos_sqlight.EventCodec(Event, DecodeError) {
+  factos_sqlight.EventCodec(encode: encode, decode: decode_event)
 }
 ```
 
-`encode` returns a `factos.Proposed` with the domain event, event type, tags, and
-the KurrentDB append message. `decode` returns a `factos.Decoded` with the domain
-event, event type, and tags read from the stored event.
+For SQLite, `encode` returns a `factos_sqlight.Proposed` with an id, domain event,
+event type, tags, and encoded bytes. `decode` returns a `factos.Decoded` with the
+domain event, event type, and tags read from the stored event.
 
 The library does not force one JSON shape for tags. In a real app, store tags in
 custom metadata or payload fields consistently, and decode them at the boundary.
 
+## SQLite Backend
+
+```gleam
+import factos/sqlight as factos_sqlight
+
+use connection <- sqlight.with_connection("file:events.sqlite3")
+let assert Ok(Nil) = factos_sqlight.migrate(connection)
+
+factos_sqlight.dispatch_context(
+  connection,
+  stream: "facts",
+  query: username_context("renata"),
+  decider: registration_decider(),
+  codec: codec(),
+  command: RegisterUser("renata"),
+)
+```
+
+The SQLite backend stores an append-only `factos_events` table and uses `BEGIN IMMEDIATE` while dispatching commands. It can enforce `FailIfEventsMatch(query, after)` inside the same SQLite transaction.
+
 ## Reading A Context
 
 ```gleam
-factos.read_context(
+factos_sqlight.read_context(
   connection,
   query: username_context("renata"),
   decider: registration_decider(),
   codec: codec(),
-  timeout: 5000,
 )
 ```
 
-`read_context` reads from `$all`, applies a server-side event-type filter when
-possible, decodes events, filters them by the full query, folds state, and
-returns a `factos.Context`.
+Backend `read_context` functions load events, decode them, filter them by the
+full query, fold state with the decider, and return a `factos.Context`.
 
 The returned context includes:
 
@@ -182,25 +213,23 @@ factos.FailIfEventsMatch(query, after: position)
 That means: append these new facts only if no facts matching the command context
 appeared after the position used for the decision.
 
-This prototype models that condition, but the current KurrentDB-backed context
-dispatch returns `UnsupportedAppendCondition` for it because regular KurrentDB
-append checks stream revisions, not arbitrary event-type/tag queries.
+The SQLite backend enforces this condition transactionally. The KurrentDB backend
+models the same condition, but returns `UnsupportedAppendCondition` for it because
+regular KurrentDB append checks stream revisions, not arbitrary event-type/tag
+queries.
 
 ```gleam
-factos.dispatch_context(
+factos_sqlight.dispatch_context(
   connection,
   stream: "facts",
   query: username_context("renata"),
   decider: registration_decider(),
   codec: codec(),
   command: RegisterUser("renata"),
-  timeout: 5000,
 )
 ```
 
-Use this shape for stores that support DCB-style atomic append conditions. With
-the current KurrentDB operation set, it is still useful as the honest API shape,
-but it cannot complete successfully for `FailIfEventsMatch` yet.
+Use this shape for stores that support DCB-style atomic append conditions.
 
 ## Stream Consistency
 
@@ -208,13 +237,12 @@ KurrentDB can safely protect a single stream with expected revision checks. This
 is still useful when a stream is the right consistency boundary.
 
 ```gleam
-factos.dispatch_stream(
+factos_sqlight.dispatch_stream(
   connection,
   stream: "user-renata",
   decider: registration_decider(),
   codec: codec(),
   command: RegisterUser("renata"),
-  timeout: 5000,
 )
 ```
 
@@ -251,9 +279,9 @@ Factos intentionally stops at pure projection computation. It does not provide a
 materialized-view repository abstraction yet; persistence and delivery choices
 belong outside the domain component.
 
-## KurrentDB Tradeoffs
+## KurrentDB Backend Tradeoffs
 
-KurrentDB support available through the current dependency:
+KurrentDB support available through `factos_kurrentdb_erlang`:
 
 1. Read a single stream.
 2. Append to a stream with `NoStream`, `Revision(n)`, `StreamExists`, or `Any`.
