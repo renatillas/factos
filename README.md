@@ -32,6 +32,8 @@ DCB-style query-conditioned append.
 Keep commands, events, state, decisions, evolution, and errors in your app.
 
 ```gleam
+import factos
+
 pub type Command {
   RegisterUser(username: String)
 }
@@ -65,6 +67,29 @@ pub fn decide(state: UsernameState, command: Command) {
     UsernameTaken, RegisterUser(_) -> Error(UsernameAlreadyTaken)
   }
 }
+
+pub fn registration_decider() {
+  factos.decider(
+    initial: UsernameAvailable,
+    decide: decide,
+    evolve: evolve,
+  )
+}
+```
+
+`Decider` is inspired by FModel: it is a small pure domain component made from
+three things only: initial state, a decision function, and an evolution function.
+It does not know about KurrentDB, projections, subscriptions, HTTP, retries, or
+repositories.
+
+You can test a decider without any storage:
+
+```gleam
+factos.compute_events(
+  decider: registration_decider(),
+  events: [UsernameReserved("renata")],
+  command: RegisterUser("renata"),
+)
 ```
 
 ## Command Context
@@ -129,8 +154,7 @@ custom metadata or payload fields consistently, and decode them at the boundary.
 factos.read_context(
   connection,
   query: username_context("renata"),
-  initial: UsernameAvailable,
-  evolve: evolve,
+  decider: registration_decider(),
   codec: codec(),
   timeout: 5000,
 )
@@ -158,22 +182,25 @@ factos.FailIfEventsMatch(query, after: position)
 That means: append these new facts only if no facts matching the command context
 appeared after the position used for the decision.
 
-This prototype models that condition, but the current KurrentDB-backed append
-function returns `UnsupportedAppendCondition` for it because regular KurrentDB
+This prototype models that condition, but the current KurrentDB-backed context
+dispatch returns `UnsupportedAppendCondition` for it because regular KurrentDB
 append checks stream revisions, not arbitrary event-type/tag queries.
 
 ```gleam
-factos.append_with_condition(
+factos.dispatch_context(
   connection,
   stream: "facts",
-  events: events,
+  query: username_context("renata"),
+  decider: registration_decider(),
   codec: codec(),
-  condition: context.append_condition,
+  command: RegisterUser("renata"),
   timeout: 5000,
 )
 ```
 
-Use this shape for stores that support DCB-style atomic append conditions.
+Use this shape for stores that support DCB-style atomic append conditions. With
+the current KurrentDB operation set, it is still useful as the honest API shape,
+but it cannot complete successfully for `FailIfEventsMatch` yet.
 
 ## Stream Consistency
 
@@ -184,9 +211,7 @@ is still useful when a stream is the right consistency boundary.
 factos.dispatch_stream(
   connection,
   stream: "user-renata",
-  initial: UsernameAvailable,
-  decide: decide,
-  evolve: evolve,
+  decider: registration_decider(),
   codec: codec(),
   command: RegisterUser("renata"),
   timeout: 5000,
@@ -195,6 +220,36 @@ factos.dispatch_stream(
 
 This is aggregate-stream style consistency. It is not the definition of Event
 Sourcing, and it may over-conflict when unrelated events share the same stream.
+
+## Views
+
+`View` is the projection-side equivalent of a decider's `evolve` function. It is
+also pure and store-independent.
+
+```gleam
+let registrations =
+  factos.view(initial: 0, evolve: fn(count, event) {
+    case event {
+      UserRegistered(_) -> count + 1
+      UsernameReserved(_) -> count
+    }
+  })
+
+factos.project(view: registrations, events: [
+  UserRegistered("renata"),
+  UserRegistered("lucy"),
+])
+```
+
+Views can be merged when they consume the same event type:
+
+```gleam
+let dashboard = factos.merge_views(registrations, reservations)
+```
+
+Factos intentionally stops at pure projection computation. It does not provide a
+materialized-view repository abstraction yet; persistence and delivery choices
+belong outside the domain component.
 
 ## KurrentDB Tradeoffs
 
@@ -210,6 +265,21 @@ can be consumed through `$all` stream-prefix filters such as `$idx-et-...` or
 eventually consistent. They should not be treated as a command-decision
 consistency guarantee unless the write path can atomically enforce the same
 condition.
+
+## Inspired By FModel
+
+Factos borrows FModel's useful core idea: model behavior as pure data structures
+that hold functions (`Decider`, `View`) and keep infrastructure outside them.
+
+Factos intentionally does not copy these FModel parts yet:
+
+1. `Aggregate` wrappers, because the package is trying not to make aggregates the
+   center of the model.
+2. Generic repository traits, because Gleam code can pass concrete functions and
+   records without committing to one application architecture.
+3. Sagas/process managers, because they are event-driven messaging/workflow
+   concerns and should remain separate from the event-sourcing core until a real
+   use case needs them.
 
 ## Development
 

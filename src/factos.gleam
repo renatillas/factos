@@ -11,6 +11,7 @@
 //// The API keeps those concepts separate instead of pretending they are the same.
 
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import kurrentdb/operation/append_to_stream
 import kurrentdb/operation/read_all
@@ -43,6 +44,18 @@ pub type SequencePosition {
 pub type AppendCondition {
   NoAppendCondition
   FailIfEventsMatch(query: Query, after: SequencePosition)
+}
+
+pub type Decider(command, state, event, domain_error) {
+  Decider(
+    initial: state,
+    decide: fn(state, command) -> Result(List(event), domain_error),
+    evolve: fn(state, event) -> state,
+  )
+}
+
+pub type View(state, event) {
+  View(initial: state, evolve: fn(state, event) -> state)
 }
 
 pub type Revision {
@@ -136,13 +149,161 @@ pub fn query_item(
   QueryItem(types:, tags:)
 }
 
+pub fn decider(
+  initial initial: state,
+  decide decide: fn(state, command) -> Result(List(event), domain_error),
+  evolve evolve: fn(state, event) -> state,
+) -> Decider(command, state, event, domain_error) {
+  Decider(initial:, decide:, evolve:)
+}
+
+pub fn view(
+  initial initial: state,
+  evolve evolve: fn(state, event) -> state,
+) -> View(state, event) {
+  View(initial:, evolve:)
+}
+
+pub fn compute_events(
+  decider decider: Decider(command, state, event, domain_error),
+  events events: List(event),
+  command command: command,
+) -> Result(List(event), domain_error) {
+  let Decider(initial, decide, evolve) = decider
+  decide(fold_events(initial, events, evolve), command)
+}
+
+pub fn compute_state(
+  decider decider: Decider(command, state, event, domain_error),
+  current current: Option(state),
+  command command: command,
+) -> Result(state, domain_error) {
+  let Decider(initial, decide, evolve) = decider
+  let state = case current {
+    Some(state) -> state
+    None -> initial
+  }
+
+  use events <- result.try(decide(state, command))
+  Ok(fold_events(state, events, evolve))
+}
+
+pub fn project(
+  view view: View(state, event),
+  events events: List(event),
+) -> state {
+  let View(initial, evolve) = view
+  fold_events(initial, events, evolve)
+}
+
+pub fn project_from(
+  view view: View(state, event),
+  state state: state,
+  events events: List(event),
+) -> state {
+  let View(_, evolve) = view
+  fold_events(state, events, evolve)
+}
+
+pub fn merge_views(
+  first first: View(first_state, event),
+  second second: View(second_state, event),
+) -> View(#(first_state, second_state), event) {
+  let View(first_initial, first_evolve) = first
+  let View(second_initial, second_evolve) = second
+
+  use state, event <- View(initial: #(first_initial, second_initial))
+  let #(first_state, second_state) = state
+  #(first_evolve(first_state, event), second_evolve(second_state, event))
+}
+
 pub fn read_context(
   connection: kurrentdb_erlang.Connection,
   query query: Query,
-  initial initial: state,
-  evolve evolve: fn(state, event) -> state,
+  decider decider: Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, decode_error),
   timeout timeout: Int,
+) -> Result(Context(event, state), Error(domain_error, decode_error)) {
+  let Decider(initial, _, evolve) = decider
+
+  read_context_events(connection, query, initial, evolve, codec, timeout)
+}
+
+pub fn decide_context(
+  context: Context(event, state),
+  command: command,
+  decider: Decider(command, state, event, domain_error),
+) -> Result(
+  #(Context(event, state), List(event)),
+  Error(domain_error, decode_error),
+) {
+  let Decider(_, decide, _) = decider
+  use events <- result.try(
+    decide(context.state, command)
+    |> result.map_error(DomainError),
+  )
+
+  Ok(#(context, events))
+}
+
+pub fn dispatch_context(
+  connection: kurrentdb_erlang.Connection,
+  stream stream_name: String,
+  query query: Query,
+  decider decider: Decider(command, state, event, domain_error),
+  codec codec: EventCodec(event, decode_error),
+  command command: command,
+  timeout timeout: Int,
+) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
+  use context <- result.try(read_context(
+    connection,
+    query: query,
+    decider: decider,
+    codec: codec,
+    timeout: timeout,
+  ))
+  use pair <- result.try(decide_context(context, command, decider))
+  let #(context, events) = pair
+
+  append_with_condition(
+    connection,
+    stream_name,
+    events,
+    codec,
+    context.append_condition,
+    timeout,
+  )
+}
+
+fn append_with_condition(
+  connection: kurrentdb_erlang.Connection,
+  stream_name: String,
+  events: List(event),
+  codec: EventCodec(event, decode_error),
+  condition: AppendCondition,
+  timeout: Int,
+) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
+  case condition {
+    NoAppendCondition ->
+      append_to_stream_with_config(
+        connection,
+        stream_name,
+        events,
+        codec,
+        append_to_stream.configure() |> append_to_stream.any,
+        timeout,
+      )
+    FailIfEventsMatch(_, _) -> Error(UnsupportedAppendCondition(condition))
+  }
+}
+
+fn read_context_events(
+  connection: kurrentdb_erlang.Connection,
+  query: Query,
+  initial: state,
+  evolve: fn(state, event) -> state,
+  codec: EventCodec(event, decode_error),
+  timeout: Int,
 ) -> Result(Context(event, state), Error(domain_error, decode_error)) {
   let stream =
     kurrentdb_erlang.read_all(
@@ -163,51 +324,13 @@ pub fn read_context(
   )
 }
 
-pub fn decide_context(
-  context: Context(event, state),
-  command: command,
-  decide: fn(state, command) -> Result(List(event), domain_error),
-) -> Result(
-  #(Context(event, state), List(event)),
-  Error(domain_error, decode_error),
-) {
-  use events <- result.try(
-    decide(context.state, command)
-    |> result.map_error(DomainError),
-  )
-
-  Ok(#(context, events))
-}
-
-pub fn append_with_condition(
+fn load_stream_events(
   connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  events events: List(event),
-  codec codec: EventCodec(event, decode_error),
-  condition condition: AppendCondition,
-  timeout timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  case condition {
-    NoAppendCondition ->
-      append_to_stream_with_config(
-        connection,
-        stream_name,
-        events,
-        codec,
-        append_to_stream.configure() |> append_to_stream.any,
-        timeout,
-      )
-    FailIfEventsMatch(_, _) -> Error(UnsupportedAppendCondition(condition))
-  }
-}
-
-pub fn load_stream(
-  connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  initial initial: state,
-  evolve evolve: fn(state, event) -> state,
-  codec codec: EventCodec(event, decode_error),
-  timeout timeout: Int,
+  stream_name: String,
+  initial: state,
+  evolve: fn(state, event) -> state,
+  codec: EventCodec(event, decode_error),
+  timeout: Int,
 ) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
   let stream =
     kurrentdb_erlang.read_stream(
@@ -228,23 +351,35 @@ pub fn load_stream(
   )
 }
 
+pub fn load_stream(
+  connection: kurrentdb_erlang.Connection,
+  stream stream_name: String,
+  decider decider: Decider(command, state, event, domain_error),
+  codec codec: EventCodec(event, decode_error),
+  timeout timeout: Int,
+) -> Result(LoadedStream(event, state), Error(domain_error, decode_error)) {
+  let Decider(initial, _, evolve) = decider
+
+  load_stream_events(connection, stream_name, initial, evolve, codec, timeout)
+}
+
 pub fn dispatch_stream(
   connection: kurrentdb_erlang.Connection,
   stream stream_name: String,
-  initial initial: state,
-  decide decide: fn(state, command) -> Result(List(event), domain_error),
-  evolve evolve: fn(state, event) -> state,
+  decider decider: Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, decode_error),
   command command: command,
   timeout timeout: Int,
 ) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
-  use loaded <- result.try(load_stream(
+  let Decider(initial, decide, evolve) = decider
+
+  use loaded <- result.try(load_stream_events(
     connection,
-    stream: stream_name,
-    initial: initial,
-    evolve: evolve,
-    codec: codec,
-    timeout: timeout,
+    stream_name,
+    initial,
+    evolve,
+    codec,
+    timeout,
   ))
 
   use events <- result.try(
@@ -254,21 +389,21 @@ pub fn dispatch_stream(
 
   append_stream_events(
     connection,
-    stream: stream_name,
-    events: events,
-    codec: codec,
-    expected: loaded.revision,
-    timeout: timeout,
+    stream_name,
+    events,
+    codec,
+    loaded.revision,
+    timeout,
   )
 }
 
-pub fn append_stream_events(
+fn append_stream_events(
   connection: kurrentdb_erlang.Connection,
-  stream stream_name: String,
-  events events: List(event),
-  codec codec: EventCodec(event, decode_error),
-  expected expected: Revision,
-  timeout timeout: Int,
+  stream_name: String,
+  events: List(event),
+  codec: EventCodec(event, decode_error),
+  expected: Revision,
+  timeout: Int,
 ) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
   append_to_stream_with_config(
     connection,
@@ -280,19 +415,19 @@ pub fn append_stream_events(
   )
 }
 
-pub fn fold(
+fn fold_events(
   initial: state,
-  events: List(Recorded(event)),
+  events: List(event),
   evolve: fn(state, event) -> state,
 ) -> state {
-  use state, recorded <- list.fold(events, initial)
-  evolve(state, recorded.event)
+  use state, event <- list.fold(events, initial)
+  evolve(state, event)
 }
 
 pub fn matches_query(recorded: Recorded(event), query: Query) -> Bool {
   case query {
     AllEvents -> True
-    Query(items) -> list.any(items, fn(item) { matches_item(recorded, item) })
+    Query(items) -> list.any(items, matches_item(recorded, _))
   }
 }
 
@@ -305,7 +440,7 @@ pub fn highest_position(
     position, NoPosition -> position
     SequencePosition(left_commit, left_prepare),
       SequencePosition(right_commit, right_prepare)
-    -> {
+    ->
       case
         left_commit > right_commit
         || { left_commit == right_commit && left_prepare >= right_prepare }
@@ -313,7 +448,6 @@ pub fn highest_position(
         True -> left
         False -> right
       }
-    }
   }
 }
 
@@ -575,29 +709,24 @@ fn decode_recorded(
   read_event: read_stream.ReadEvent,
   codec: EventCodec(event, decode_error),
 ) -> Result(Recorded(event), Error(domain_error, decode_error)) {
-  let recorded_event = case read_event {
-    read_stream.Recorded(event) -> event
-    read_stream.Resolved(event: event, ..) -> event
-  }
-
   let EventCodec(_, decode) = codec
   use decoded <- result.try(
-    decode(recorded_event)
+    decode(read_event.event)
     |> result.map_error(DecodeError),
   )
 
   let Decoded(event, type_, tags) = decoded
   Ok(Recorded(
-    id: recorded_event.id,
-    stream: recorded_event.stream,
-    revision: recorded_event.revision,
+    id: read_event.event.id,
+    stream: read_event.event.stream,
+    revision: read_event.event.revision,
     position: SequencePosition(
-      recorded_event.commit_position,
-      recorded_event.prepare_position,
+      read_event.event.commit_position,
+      read_event.event.prepare_position,
     ),
-    metadata: recorded_event.metadata,
-    custom_metadata: recorded_event.custom_metadata,
-    data: recorded_event.data,
+    metadata: read_event.event.metadata,
+    custom_metadata: read_event.event.custom_metadata,
+    data: read_event.event.data,
     type_: type_,
     tags: tags,
     event: event,
@@ -649,17 +778,21 @@ fn matches_item(recorded: Recorded(event), item: QueryItem) -> Bool {
 fn matches_types(event_type: EventType, types: List(EventType)) -> Bool {
   case types {
     [] -> True
-    [_, ..] -> list.any(types, fn(required) { event_type == required })
+    [_, ..] -> {
+      use required <- list.any(types)
+      event_type == required
+    }
   }
 }
 
 fn matches_tags(event_tags: List(Tag), required_tags: List(Tag)) -> Bool {
   case required_tags {
     [] -> True
-    [_, ..] ->
-      list.all(required_tags, fn(required) {
-        list.any(event_tags, fn(tag) { tag == required })
-      })
+    [_, ..] -> {
+      use required <- list.all(required_tags)
+      use tag <- list.any(event_tags)
+      tag == required
+    }
   }
 }
 
