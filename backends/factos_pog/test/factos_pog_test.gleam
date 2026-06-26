@@ -1,11 +1,14 @@
 import factos
-import factos/factos_sqlight
+import factos/factos_pog
 import gleam/bit_array
+import gleam/erlang/process
 import gleam/int
 import gleam/list
+import gleam/option.{Some}
 import gleam/result
 import gleeunit
-import sqlight
+import global_value
+import pog
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -45,12 +48,16 @@ type CounterState {
   CounterState(total: Int)
 }
 
-pub fn dispatch_stream_persists_events_test() {
-  use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+type TestGlobalData {
+  TestGlobalData(connection: pog.Connection)
+}
 
-  let assert Ok(factos_sqlight.Append(current_revision: 0, position: _)) =
-    factos_sqlight.dispatch_stream(
+pub fn dispatch_stream_persists_events_test() {
+  let TestGlobalData(connection) = global_data()
+  reset_schema(connection)
+
+  let assert Ok(factos_pog.Append(current_revision: 0, position: _)) =
+    factos_pog.dispatch_stream(
       connection,
       stream: "user-renata",
       decider: decider(),
@@ -59,7 +66,7 @@ pub fn dispatch_stream_persists_events_test() {
     )
 
   let assert Ok(loaded) =
-    factos_sqlight.load_stream(
+    factos_pog.load_stream(
       connection,
       stream: "user-renata",
       decider: decider(),
@@ -70,31 +77,41 @@ pub fn dispatch_stream_persists_events_test() {
   assert loaded.revision == factos.CurrentRevision(0)
 }
 
-pub fn dispatch_stream_handles_many_events_test() {
-  use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+pub fn dispatch_context_reads_by_event_type_and_tags_test() {
+  let TestGlobalData(connection) = global_data()
+  reset_schema(connection)
 
-  let assert Ok(factos_sqlight.Append(
-    current_revision: 249,
+  let query = username_query("renata")
+
+  let assert Ok(factos_pog.Append(
+    current_revision: 0,
     position: factos.SequencePosition(_),
-  )) = dispatch_counter_stream_many(connection, 250)
-
-  let assert Ok(loaded) =
-    factos_sqlight.load_stream(
+  )) =
+    factos_pog.dispatch_context(
       connection,
-      stream: "counter-load",
-      decider: counter_decider(),
-      codec: counter_codec(),
+      stream: "user-renata",
+      query: query,
+      decider: decider(),
+      codec: codec(),
+      command: RegisterUser("renata"),
     )
 
-  assert loaded.state == CounterState(250)
-  assert loaded.revision == factos.CurrentRevision(249)
-  assert list.length(loaded.events) == 250
+  let assert Ok(context) =
+    factos_pog.read_context(
+      connection,
+      query: query,
+      decider: decider(),
+      codec: codec(),
+    )
+
+  assert context.state == Taken
+  assert list.length(context.events) == 1
+  assert context.position != factos.NoPosition
 }
 
 pub fn dispatch_context_handles_many_streams_test() {
-  use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+  let TestGlobalData(connection) = global_data()
+  reset_schema(connection)
 
   let query =
     factos.query([
@@ -103,22 +120,59 @@ pub fn dispatch_context_handles_many_streams_test() {
       ]),
     ])
 
-  let assert Ok(factos_sqlight.Append(
+  let assert Ok(factos_pog.Append(
     current_revision: 0,
     position: factos.SequencePosition(_),
-  )) = dispatch_counter_context_many(connection, query, 100)
+  )) = dispatch_counter_context_many(connection, query, 25)
 
   let assert Ok(context) =
-    factos_sqlight.read_context(
+    factos_pog.read_context(
       connection,
       query: query,
       decider: counter_decider(),
       codec: counter_codec(),
     )
 
-  assert context.state == CounterState(100)
-  assert list.length(context.events) == 100
-  assert context.position != factos.NoPosition
+  assert context.state == CounterState(25)
+  assert list.length(context.events) == 25
+}
+
+fn global_data() -> TestGlobalData {
+  global_value.create_with_unique_name("factos_pog_test.global.data", fn() {
+    TestGlobalData(connection: start_test_connection())
+  })
+}
+
+fn start_test_connection() -> pog.Connection {
+  let pool_name = process.new_name("factos_pog_test")
+  let config =
+    pog.default_config(pool_name)
+    |> pog.host("127.0.0.1")
+    |> pog.port(5432)
+    |> pog.database("factos_pog")
+    |> pog.user("postgres")
+    |> pog.password(Some("postgres"))
+    |> pog.ssl(pog.SslDisabled)
+
+  let assert Ok(_) = pog.start(config)
+  process.sleep(100)
+  pog.named_connection(pool_name)
+}
+
+fn reset_schema(connection: pog.Connection) -> Nil {
+  let assert Ok(_) =
+    pog.query("drop table if exists factos_events")
+    |> pog.execute(on: connection)
+  let assert Ok(Nil) = factos_pog.migrate(connection)
+  Nil
+}
+
+fn username_query(username: String) -> factos.Query {
+  factos.query([
+    factos.query_item(types: [factos.event_type("UserRegistered")], tags: [
+      factos.tag("username:" <> username),
+    ]),
+  ])
 }
 
 fn decider() -> factos.Decider(Command, State, Event, DomainError) {
@@ -136,12 +190,12 @@ fn evolve(_state: State, _event: Event) -> State {
   Taken
 }
 
-fn codec() -> factos_sqlight.EventCodec(Event, DecodeError) {
-  factos_sqlight.EventCodec(encode:, decode:)
+fn codec() -> factos_pog.EventCodec(Event, DecodeError) {
+  factos_pog.EventCodec(encode:, decode:)
 }
 
-fn encode(event: Event) -> factos_sqlight.Proposed(Event) {
-  factos_sqlight.Proposed(
+fn encode(event: Event) -> factos_pog.Proposed(Event) {
+  factos_pog.Proposed(
     id: "event-" <> event.username,
     event: event,
     type_: factos.event_type("UserRegistered"),
@@ -151,7 +205,7 @@ fn encode(event: Event) -> factos_sqlight.Proposed(Event) {
 }
 
 fn decode(
-  stored: factos_sqlight.StoredEvent,
+  stored: factos_pog.StoredEvent,
 ) -> Result(factos.Decoded(Event), DecodeError) {
   case factos.event_type_name(stored.type_) {
     "UserRegistered" -> {
@@ -169,45 +223,14 @@ fn decode(
   }
 }
 
-fn dispatch_counter_stream_many(
-  connection: sqlight.Connection,
-  remaining: Int,
-) -> Result(factos_sqlight.Append, factos_sqlight.Error(Nil, DecodeError)) {
-  case remaining {
-    0 ->
-      factos_sqlight.dispatch_stream(
-        connection,
-        stream: "counter-load",
-        decider: counter_decider(),
-        codec: counter_codec(),
-        command: Increment,
-      )
-    _ -> {
-      let result =
-        factos_sqlight.dispatch_stream(
-          connection,
-          stream: "counter-load",
-          decider: counter_decider(),
-          codec: counter_codec(),
-          command: Increment,
-        )
-      case remaining, result {
-        1, _ -> result
-        _, Ok(_) -> dispatch_counter_stream_many(connection, remaining - 1)
-        _, Error(error) -> Error(error)
-      }
-    }
-  }
-}
-
 fn dispatch_counter_context_many(
-  connection: sqlight.Connection,
+  connection: pog.Connection,
   query: factos.Query,
   remaining: Int,
-) -> Result(factos_sqlight.Append, factos_sqlight.Error(Nil, DecodeError)) {
+) -> Result(factos_pog.Append, factos_pog.Error(Nil, DecodeError)) {
   case remaining {
     0 ->
-      factos_sqlight.dispatch_context(
+      factos_pog.dispatch_context(
         connection,
         stream: "counter-context-0",
         query: query,
@@ -218,7 +241,7 @@ fn dispatch_counter_context_many(
     _ -> {
       let stream_name = "counter-context-" <> int.to_string(remaining)
       let result =
-        factos_sqlight.dispatch_context(
+        factos_pog.dispatch_context(
           connection,
           stream: stream_name,
           query: query,
@@ -266,8 +289,8 @@ fn counter_evolve(state: CounterState, event: CounterEvent) -> CounterState {
   }
 }
 
-fn counter_codec() -> factos_sqlight.EventCodec(CounterEvent, DecodeError) {
-  factos_sqlight.EventCodec(
+fn counter_codec() -> factos_pog.EventCodec(CounterEvent, DecodeError) {
+  factos_pog.EventCodec(
     encode: encode_counter_event,
     decode: decode_counter_event,
   )
@@ -275,10 +298,10 @@ fn counter_codec() -> factos_sqlight.EventCodec(CounterEvent, DecodeError) {
 
 fn encode_counter_event(
   event: CounterEvent,
-) -> factos_sqlight.Proposed(CounterEvent) {
+) -> factos_pog.Proposed(CounterEvent) {
   case event {
     Incremented(value) ->
-      factos_sqlight.Proposed(
+      factos_pog.Proposed(
         id: "counter-event-" <> int.to_string(value),
         event: event,
         type_: factos.event_type("Incremented"),
@@ -289,7 +312,7 @@ fn encode_counter_event(
 }
 
 fn decode_counter_event(
-  stored: factos_sqlight.StoredEvent,
+  stored: factos_pog.StoredEvent,
 ) -> Result(factos.Decoded(CounterEvent), DecodeError) {
   case factos.event_type_name(stored.type_) {
     "Incremented" -> {

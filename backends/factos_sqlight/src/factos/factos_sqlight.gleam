@@ -1,4 +1,21 @@
 //// SQLite backend for Factos using the `sqlight` package.
+////
+//// This backend stores events in an append-only `factos_events` table and uses
+//// SQLite transactions to implement both supported dispatch styles:
+////
+//// 1. `dispatch_stream` protects one stream with a per-stream revision check.
+//// 2. `dispatch_context` protects a command context with
+////    `FailIfEventsMatch(query, after)`.
+////
+//// The context flow is the important part for Command Context Consistency. The
+//// command reads the facts selected by a `factos.Query`, folds them into a
+//// temporary decision state, decides new facts, and appends those facts only when
+//// no matching facts appeared after the observed position. SQLite can enforce
+//// that condition transactionally because the context check and append happen in
+//// the same database transaction.
+////
+//// Event payload encoding is deliberately application-owned. The backend only
+//// stores bytes plus query metadata (`EventType` and `Tag`).
 
 import factos
 import gleam/dynamic/decode
@@ -8,6 +25,11 @@ import gleam/string
 import sqlight
 
 pub type Proposed(event) {
+  /// A domain event prepared for SQLite persistence.
+  ///
+  /// The application codec creates this value. `id` should identify the event for
+  /// the application. `type_` and `tags` are store-visible query metadata. `data`
+  /// is opaque bytes owned by the application codec.
   Proposed(
     id: String,
     event: event,
@@ -18,6 +40,11 @@ pub type Proposed(event) {
 }
 
 pub type StoredEvent {
+  /// A raw event row read from SQLite before domain decoding.
+  ///
+  /// Decoders receive this value so they can inspect the stored event type, tags,
+  /// and bytes. `position` is the global append order. `revision` is the
+  /// per-stream revision.
   StoredEvent(
     position: Int,
     id: String,
@@ -30,6 +57,11 @@ pub type StoredEvent {
 }
 
 pub type EventCodec(event, decode_error) {
+  /// Application-owned SQLite event codec.
+  ///
+  /// `encode` converts a domain event into bytes and metadata. `decode` converts a
+  /// stored row back into a `factos.Decoded` domain event. Decode failures are kept
+  /// in the application's own error type and wrapped as `DecodeError`.
   EventCodec(
     encode: fn(event) -> Proposed(event),
     decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
@@ -37,17 +69,35 @@ pub type EventCodec(event, decode_error) {
 }
 
 pub type Append {
+  /// Result of a successful append.
+  ///
+  /// `current_revision` is the latest revision of the target stream after the
+  /// append. `position` is the global position of the last inserted event, or
+  /// `NoPosition` when no events were produced.
   Append(current_revision: Int, position: factos.SequencePosition)
 }
 
 pub type Error(domain_error, decode_error) {
+  /// The decider rejected the command with a domain error.
   DomainError(domain_error)
+
+  /// The application codec could not decode a stored event.
   DecodeError(decode_error)
+
+  /// SQLite returned an error.
   StoreError(sqlight.Error)
+
+  /// A stream revision or context append condition failed.
   AppendConditionFailed(factos.AppendCondition)
 }
 
-pub fn migrate(connection: sqlight.Connection) -> Result(Nil, sqlight.Error) {
+/// Create or update the SQLite schema required by this backend.
+///
+/// The schema is an append-only `factos_events` table with a global autoincrement
+/// `position`, per-stream `revision`, event `type`, newline-encoded `tags`, and
+/// opaque `data` bytes. It also creates indexes for stream/revision reads and
+/// position-based context checks.
+pub fn migrate(connection: sqlight.Connection) -> Result(Nil, Error(_, _)) {
   sqlight.exec(
     "
     create table if not exists factos_events (
@@ -67,8 +117,15 @@ pub fn migrate(connection: sqlight.Connection) -> Result(Nil, sqlight.Error) {
     ",
     on: connection,
   )
+  |> result.map_error(StoreError)
 }
 
+/// Read and fold the facts selected by a command-context query.
+///
+/// The backend reads stored rows, decodes them with the supplied codec, filters
+/// them with `factos.matches_query`, folds matching events with the decider's
+/// `evolve` function, and returns a `factos.Context` with a
+/// `FailIfEventsMatch(query, after)` append condition.
 pub fn read_context(
   connection: sqlight.Connection,
   query query: factos.Query,
@@ -93,6 +150,15 @@ pub fn read_context(
   ))
 }
 
+/// Run a full context-first read-decide-append command flow.
+///
+/// This function starts `BEGIN IMMEDIATE`, reads the query context, runs the
+/// decider, verifies that no matching events appeared after the context position,
+/// appends produced events to `stream`, and commits. Any error rolls the
+/// transaction back.
+///
+/// Use this when the command's real consistency boundary is the selected event
+/// context rather than one predefined stream.
 pub fn dispatch_context(
   connection: sqlight.Connection,
   stream stream_name: String,
@@ -131,6 +197,11 @@ pub fn dispatch_context(
   finish_transaction(connection, result)
 }
 
+/// Load and fold one stream.
+///
+/// This supports classic stream-revision consistency. The returned
+/// `factos.LoadedStream` contains the folded state, decoded recorded events, and
+/// current stream revision.
 pub fn load_stream(
   connection: sqlight.Connection,
   stream stream_name: String,
@@ -155,6 +226,11 @@ pub fn load_stream(
   ))
 }
 
+/// Run a stream-based read-decide-append command flow.
+///
+/// The backend loads the target stream, folds it into state, runs the decider, and
+/// appends produced events only if the stream revision still matches the loaded
+/// revision. Use this when one stream is the intended consistency boundary.
 pub fn dispatch_stream(
   connection: sqlight.Connection,
   stream stream_name: String,
@@ -423,18 +499,17 @@ fn current_revision(
   connection: sqlight.Connection,
   stream_name: String,
 ) -> Result(Int, sqlight.Error) {
-  sqlight.query(
+  use rows <- result.map(sqlight.query(
     "select coalesce(max(revision), -1) from factos_events where stream = ?",
     on: connection,
     with: [sqlight.text(stream_name)],
     expecting: int_field_decoder(),
-  )
-  |> result.map(fn(rows) {
-    case rows {
-      [revision, ..] -> revision
-      [] -> -1
-    }
-  })
+  ))
+
+  case rows {
+    [revision, ..] -> revision
+    [] -> -1
+  }
 }
 
 fn has_matching_events_after(

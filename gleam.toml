@@ -1,5 +1,10 @@
 name = "factos"
 version = "1.0.0"
+description = "Store-independent context-first Event Sourcing primitives for Gleam."
+licences = ["Apache-2.0"]
+links = [
+  { title = "Simply Event Sourcing", href = "https://ricofritzsche.me/simply-event-sourcing/" },
+]
 
 # Fill out these fields if you intend to generate HTML documentation or publish
 # your project to the Hex package manager.

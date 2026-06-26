@@ -1,5 +1,5 @@
 import factos
-import factos/kurrentdb as factos_kurrentdb
+import factos/factos_kurrentdb_erlang
 import gleam/bit_array
 import gleam/int
 import gleam/list
@@ -51,7 +51,7 @@ pub fn dispatch_stream_handles_many_events_integration_test() {
     dispatch_counter_stream_many(stream_name, event_type, 100)
 
   let assert Ok(loaded) =
-    factos_kurrentdb.load_stream(
+    factos_kurrentdb_erlang.load_stream(
       connection(),
       stream: stream_name,
       decider: counter_decider(),
@@ -77,7 +77,7 @@ pub fn read_context_handles_many_streams_integration_test() {
     dispatch_counter_context_streams_many(event_type, 50)
 
   let assert Ok(context) =
-    factos_kurrentdb.read_context(
+    factos_kurrentdb_erlang.read_context(
       connection(),
       query: query,
       decider: counter_decider(),
@@ -111,9 +111,12 @@ fn dispatch_counter_stream_many(
   stream_name: String,
   event_type: String,
   remaining: Int,
-) -> Result(append_to_stream.Append, factos_kurrentdb.Error(Nil, DecodeError)) {
+) -> Result(
+  append_to_stream.Append,
+  factos_kurrentdb_erlang.Error(Nil, DecodeError),
+) {
   let result =
-    factos_kurrentdb.dispatch_stream(
+    factos_kurrentdb_erlang.dispatch_stream(
       connection(),
       stream: stream_name,
       decider: counter_decider(),
@@ -133,9 +136,12 @@ fn dispatch_counter_stream_many(
 fn dispatch_counter_context_streams_many(
   event_type: String,
   remaining: Int,
-) -> Result(append_to_stream.Append, factos_kurrentdb.Error(Nil, DecodeError)) {
+) -> Result(
+  append_to_stream.Append,
+  factos_kurrentdb_erlang.Error(Nil, DecodeError),
+) {
   let result =
-    factos_kurrentdb.dispatch_stream(
+    factos_kurrentdb_erlang.dispatch_stream(
       connection(),
       stream: unique_name("counter-context"),
       decider: counter_decider(),
@@ -183,8 +189,8 @@ fn counter_evolve(state: CounterState, event: CounterEvent) -> CounterState {
 
 fn counter_codec(
   event_type: String,
-) -> factos_kurrentdb.EventCodec(CounterEvent, DecodeError) {
-  factos_kurrentdb.EventCodec(
+) -> factos_kurrentdb_erlang.EventCodec(CounterEvent, DecodeError) {
+  factos_kurrentdb_erlang.EventCodec(
     encode: encode_counter_event(_, event_type),
     decode: decode_counter_event(_, event_type),
   )
@@ -193,10 +199,10 @@ fn counter_codec(
 fn encode_counter_event(
   event: CounterEvent,
   event_type: String,
-) -> factos_kurrentdb.Proposed(CounterEvent) {
+) -> factos_kurrentdb_erlang.Proposed(CounterEvent) {
   case event {
     Incremented(value) ->
-      factos_kurrentdb.Proposed(
+      factos_kurrentdb_erlang.Proposed(
         event: event,
         type_: factos.event_type(event_type),
         tags: [factos.tag("counter:load")],

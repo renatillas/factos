@@ -1,0 +1,13 @@
+name = "tickets_pog"
+version = "1.0.0"
+
+[dependencies]
+factos = { path = "../.." }
+factos_pog = { path = "../../backends/factos_pog" }
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+global_value = ">= 1.0.0 and < 2.0.0"
+pog = ">= 4.1.0 and < 5.0.0"
+
+[dev_dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

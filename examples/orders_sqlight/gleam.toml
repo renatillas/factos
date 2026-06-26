@@ -1,0 +1,13 @@
+name = "orders_sqlight"
+version = "1.0.0"
+
+[dependencies]
+factos = { path = "../.." }
+factos_sqlight = { path = "../../backends/factos_sqlight" }
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+simplifile = ">= 2.0.0 and < 3.0.0"
+sqlight = ">= 1.1.0 and < 2.0.0"
+
+[dev_dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

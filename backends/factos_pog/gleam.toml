@@ -1,6 +1,6 @@
-name = "factos_kurrentdb_erlang"
+name = "factos_pog"
 version = "1.0.0"
-description = "KurrentDB Erlang backend for Factos context-first Event Sourcing."
+description = "PostgreSQL backend for Factos context-first Event Sourcing using pog."
 licences = ["Apache-2.0"]
 links = [
   { title = "Factos", href = "https://factos.hexdocs.pm" },
@@ -10,11 +10,9 @@ links = [
 [dependencies]
 factos = { path = "../.." }
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
-kurrentdb = { path = "../../../kurrentdb" }
-kurrentdb_erlang = { path = "../../../kurrentdb/backends/kurrentdb_erlang" }
-youid = ">= 1.6.0 and < 2.0.0"
+pog = ">= 4.1.0 and < 5.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-gleam_json = ">= 3.0.0 and < 4.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
 global_value = ">= 1.0.0 and < 2.0.0"

@@ -1,8 +1,19 @@
 //// KurrentDB Erlang backend for Factos.
 ////
-//// This backend supports stream revision consistency. It can read command
-//// contexts from `$all`, but KurrentDB's regular append operation cannot
-//// atomically enforce Factos' DCB-style `FailIfEventsMatch` append condition.
+//// This backend integrates Factos with the Erlang-target KurrentDB client. It
+//// supports stream revision consistency and context reads from `$all`.
+////
+//// KurrentDB's regular append API can protect a stream with expected revision
+//// checks. That is useful when the stream is the real consistency boundary.
+//// However, a Factos context append condition is query-based:
+//// `FailIfEventsMatch(query, after)`. KurrentDB's regular append operation cannot
+//// atomically enforce an arbitrary event-type/tag query condition, so this backend
+//// reports `UnsupportedAppendCondition` for context dispatch.
+////
+//// This distinction is intentional. Stream revision consistency is one valid
+//// Event Sourcing implementation strategy; Command Context Consistency and DCB-
+//// style tag contracts require stores or write paths that can protect the actual
+//// command context.
 
 import factos
 import gleam/list
@@ -14,6 +25,11 @@ import kurrentdb_erlang
 import youid/uuid
 
 pub type Proposed(event) {
+  /// A domain event prepared for KurrentDB persistence.
+  ///
+  /// The application codec creates this value. `event` is kept for domain-level
+  /// typing, `type_` and `tags` are Factos query metadata, and `message` is the
+  /// KurrentDB append event sent to the client.
   Proposed(
     event: event,
     type_: factos.EventType,
@@ -23,6 +39,11 @@ pub type Proposed(event) {
 }
 
 pub type EventCodec(event, decode_error) {
+  /// Application-owned KurrentDB event codec.
+  ///
+  /// `encode` converts a domain event into a KurrentDB append message plus Factos
+  /// metadata. `decode` converts a KurrentDB recorded event into a
+  /// `factos.Decoded` domain event. Decode failures are wrapped as `DecodeError`.
   EventCodec(
     encode: fn(event) -> Proposed(event),
     decode: fn(read_stream.RecordedEvent) ->
@@ -31,14 +52,35 @@ pub type EventCodec(event, decode_error) {
 }
 
 pub type Error(domain_error, decode_error) {
+  /// The decider rejected the command with a domain error.
   DomainError(domain_error)
+
+  /// The application codec could not decode a stored event.
   DecodeError(decode_error)
+
+  /// KurrentDB returned an error while reading a stream or `$all`.
   ReadError(kurrentdb_erlang.Error(read_stream.ResponseError))
+
+  /// KurrentDB returned an error while appending to a stream.
   AppendError(kurrentdb_erlang.Error(append_to_stream.ResponseError))
+
+  /// A read stream did not produce a message before the configured timeout.
   ReadTimedOut
+
+  /// The requested append condition cannot be enforced by this backend.
+  ///
+  /// This is expected for `FailIfEventsMatch` because the regular KurrentDB append
+  /// API protects stream revisions, not arbitrary Factos context queries.
   UnsupportedAppendCondition(factos.AppendCondition)
 }
 
+/// Read and fold a command context from KurrentDB `$all`.
+///
+/// Event types in the query are translated into a KurrentDB event-type prefix
+/// filter where possible. Decoded events are then filtered locally with the full
+/// Factos query, including tags. The returned context contains a
+/// `FailIfEventsMatch(query, after)` append condition, but this backend cannot
+/// enforce that condition during append.
 pub fn read_context(
   connection: kurrentdb_erlang.Connection,
   query query: factos.Query,
@@ -51,6 +93,15 @@ pub fn read_context(
   read_context_events(connection, query, initial, evolve, codec, timeout)
 }
 
+/// Attempt a full context-first dispatch flow.
+///
+/// This function reads the context and runs the decider, then delegates to
+/// `append_with_condition`. Because normal KurrentDB appends cannot enforce
+/// `FailIfEventsMatch`, context dispatch returns `UnsupportedAppendCondition` for
+/// the context condition produced by `read_context`.
+///
+/// Use this function to make the storage limitation explicit. Prefer
+/// `dispatch_stream` when a stream revision is the intended consistency boundary.
 pub fn dispatch_context(
   connection: kurrentdb_erlang.Connection,
   stream stream_name: String,
@@ -62,10 +113,10 @@ pub fn dispatch_context(
 ) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
   use context <- result.try(read_context(
     connection,
-    query: query,
-    decider: decider,
-    codec: codec,
-    timeout: timeout,
+    query:,
+    decider:,
+    codec:,
+    timeout:,
   ))
   use pair <- result.try(
     factos.decide_context(context, command, decider)
@@ -83,6 +134,11 @@ pub fn dispatch_context(
   )
 }
 
+/// Load and fold one KurrentDB stream.
+///
+/// Missing streams are treated as empty streams and returned with
+/// `factos.NoEvents`. Existing streams return their latest observed revision as
+/// `factos.CurrentRevision(n)`.
 pub fn load_stream(
   connection: kurrentdb_erlang.Connection,
   stream stream_name: String,
@@ -98,6 +154,11 @@ pub fn load_stream(
   load_stream_events(connection, stream_name, initial, evolve, codec, timeout)
 }
 
+/// Run a stream-based read-decide-append command flow.
+///
+/// The backend loads the target stream, folds it into state, runs the decider, and
+/// appends produced events with KurrentDB expected-revision checks. Use this when
+/// one KurrentDB stream is the correct consistency boundary for the command.
 pub fn dispatch_stream(
   connection: kurrentdb_erlang.Connection,
   stream stream_name: String,
@@ -236,7 +297,7 @@ fn append_to_stream_with_config(
   events: List(event),
   codec: EventCodec(event, decode_error),
   config: append_to_stream.Configuration,
-  timeout: Int,
+  within: Int,
 ) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
   case events {
     [] ->
@@ -250,14 +311,11 @@ fn append_to_stream_with_config(
         kurrentdb_erlang.append_to_stream(
           connection,
           stream: stream_name,
-          events: list.map(events, fn(event) {
-            let Proposed(message: message, ..) = encode(event)
-            message
-          }),
+          events: list.map(events, fn(event) { encode(event).message }),
           config: config,
         )
 
-      kurrentdb_erlang.await(task, within: timeout)
+      kurrentdb_erlang.await(task, within:)
       |> result.map_error(AppendError)
     }
   }
@@ -271,9 +329,9 @@ fn receive_context(
   codec: EventCodec(event, decode_error),
   events: List(factos.Recorded(event)),
   position: factos.SequencePosition,
-  timeout: Int,
+  within: Int,
 ) -> Result(factos.Context(event, state), Error(domain_error, decode_error)) {
-  case kurrentdb_erlang.receive(stream, within: timeout) {
+  case kurrentdb_erlang.receive(stream, within:) {
     Error(Nil) -> {
       kurrentdb_erlang.close(stream)
       Error(ReadTimedOut)
@@ -292,18 +350,6 @@ fn receive_context(
       kurrentdb_erlang.close(stream)
       Error(ReadError(error))
     }
-    Ok(kurrentdb_erlang.ReadEvent(event)) ->
-      receive_context_event(
-        stream,
-        query,
-        state,
-        evolve,
-        codec,
-        events,
-        position,
-        timeout,
-        event,
-      )
     Ok(kurrentdb_erlang.ReadMessage(read_stream.ReadEvent(event))) ->
       receive_context_event(
         stream,
@@ -313,7 +359,7 @@ fn receive_context(
         codec,
         events,
         position,
-        timeout,
+        within,
         event,
       )
     Ok(kurrentdb_erlang.ReadMessage(read_stream.LastAllStreamPosition(read_stream.Position(
@@ -331,7 +377,7 @@ fn receive_context(
           position,
           factos.SequencePosition(commit_position),
         ),
-        timeout,
+        within,
       )
     Ok(kurrentdb_erlang.ReadMessage(_)) ->
       receive_context(
@@ -342,7 +388,7 @@ fn receive_context(
         codec,
         events,
         position,
-        timeout,
+        within,
       )
   }
 }
@@ -395,12 +441,12 @@ fn receive_stream(
   codec: EventCodec(event, decode_error),
   events: List(factos.Recorded(event)),
   revision: factos.Revision,
-  timeout: Int,
+  within: Int,
 ) -> Result(
   factos.LoadedStream(event, state),
   Error(domain_error, decode_error),
 ) {
-  case kurrentdb_erlang.receive(stream, within: timeout) {
+  case kurrentdb_erlang.receive(stream, within:) {
     Error(Nil) -> {
       kurrentdb_erlang.close(stream)
       Error(ReadTimedOut)
@@ -427,17 +473,6 @@ fn receive_stream(
         _ -> Error(ReadError(error))
       }
     }
-    Ok(kurrentdb_erlang.ReadEvent(event)) ->
-      receive_stream_event(
-        stream,
-        stream_name,
-        state,
-        evolve,
-        codec,
-        events,
-        timeout,
-        event,
-      )
     Ok(kurrentdb_erlang.ReadMessage(read_stream.ReadEvent(event))) ->
       receive_stream_event(
         stream,
@@ -446,7 +481,7 @@ fn receive_stream(
         evolve,
         codec,
         events,
-        timeout,
+        within,
         event,
       )
     Ok(kurrentdb_erlang.ReadMessage(_)) ->
@@ -458,7 +493,7 @@ fn receive_stream(
         codec,
         events,
         revision,
-        timeout,
+        within,
       )
   }
 }

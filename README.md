@@ -1,35 +1,72 @@
 # Factos
 
-Prototype context-first event-sourcing helpers for Gleam.
+Factos is a set of prototype Gleam libraries for context-first Event Sourcing.
 
-This package deliberately does not model Event Sourcing as aggregates. A command
-capability reads the facts relevant to one decision, folds a temporary decision
-model, decides which new facts to record, and records them only when the relevant
-context can be protected.
+The libraries are based on the interpretation described in Rico Fritzsche's
+[Simply Event Sourcing](https://ricofritzsche.me/simply-event-sourcing/): Event
+Sourcing is not defined by aggregates, aggregate roots, CQRS, message brokers,
+microservices, or stream-per-object storage. Event Sourcing means accepted facts
+are persisted as the authoritative history of the system, and that relevant
+history is used when deciding whether new facts may be accepted.
 
-## Opinion
+Factos models that idea directly:
 
-Event Sourcing is the persistence idea: accepted facts are the authoritative
-state of the system. Aggregates, CQRS, projections, message brokers, and stream
-versioning are implementation choices.
+1. A command arrives with an intention.
+2. A domain capability chooses the facts relevant to that decision.
+3. Those facts are folded into a temporary decision state.
+4. The decision either rejects the command with a domain error or produces new facts.
+5. The store appends the new facts only if the relevant context has remained stable.
 
-This prototype follows the shape described by Command Context Consistency and
-Dynamic Consistency Boundaries:
+The consistency boundary follows the command decision. It is not forced to be a
+predefined `User`, `Order`, or `Customer` aggregate stream.
 
-1. A command defines the context it needs.
-2. The context is expressed as a query over event types and tags.
-3. The application folds only those facts into a decision model.
-4. The application produces new facts.
-5. The store must reject the append if matching facts appeared after the context
-   was observed.
+## Libraries
 
-That last step requires store support. KurrentDB's normal append API supports
-expected stream revision checks. That is useful, but it is not the same as a
-DCB-style query-conditioned append.
+This repository contains three Gleam libraries:
 
-## Domain Model
+1. `factos`: store-independent domain primitives.
+2. `factos_sqlight`: SQLite backend implemented with the `sqlight` package.
+3. `factos_kurrentdb_erlang`: KurrentDB backend for the Erlang target.
 
-Keep commands, events, state, decisions, evolution, and errors in your app.
+The core library is intentionally small. It knows about facts, event types, tags,
+queries, contexts, deciders, views, recorded events, loaded streams, and append
+conditions. It does not know how bytes are encoded, where events are stored, how
+subscriptions work, whether projections are synchronous, or which transport is
+used.
+
+Backend libraries own storage details. They define storage codecs, persistence
+errors, migrations, and dispatch functions for their storage technology.
+
+## Concepts
+
+### Events Are Facts
+
+An event is a fact that has been accepted by the application. The event history is
+the source of truth. Derived state can be rebuilt by folding events with an
+evolution function.
+
+Factos does not require a base `Event` interface. Your application defines its own
+event type:
+
+```gleam
+pub type Event {
+  UsernameReserved(username: String)
+  UserRegistered(username: String)
+  DisplayNameChanged(user_id: String, name: String)
+}
+```
+
+### Deciders Are Pure Domain Capabilities
+
+A `Decider` is a pure command-handling component made from:
+
+1. an initial state,
+2. a decision function, and
+3. an evolution function.
+
+The decision function receives the temporary state needed for one command and
+returns either new events or a domain error. The evolution function folds accepted
+events into that state.
 
 ```gleam
 import factos
@@ -38,12 +75,7 @@ pub type Command {
   RegisterUser(username: String)
 }
 
-pub type Event {
-  UsernameReserved(username: String)
-  UserRegistered(username: String)
-}
-
-pub type UsernameState {
+pub type State {
   UsernameAvailable
   UsernameTaken
 }
@@ -52,37 +84,34 @@ pub type DomainError {
   UsernameAlreadyTaken
 }
 
-pub fn evolve(state: UsernameState, event: Event) -> UsernameState {
+pub fn evolve(state: State, event: Event) -> State {
   case state, event {
     UsernameAvailable, UsernameReserved(_) -> UsernameTaken
     UsernameAvailable, UserRegistered(_) -> UsernameTaken
+    UsernameAvailable, DisplayNameChanged(_, _) -> state
     UsernameTaken, UsernameReserved(_) -> state
     UsernameTaken, UserRegistered(_) -> state
+    UsernameTaken, DisplayNameChanged(_, _) -> state
   }
 }
 
-pub fn decide(state: UsernameState, command: Command) {
+pub fn decide(state: State, command: Command) -> Result(List(Event), DomainError) {
   case state, command {
     UsernameAvailable, RegisterUser(username) -> Ok([UserRegistered(username)])
     UsernameTaken, RegisterUser(_) -> Error(UsernameAlreadyTaken)
   }
 }
 
-pub fn registration_decider() {
+pub fn registration_decider() -> factos.Decider(Command, State, Event, DomainError) {
   factos.decider(
     initial: UsernameAvailable,
-    decide: decide,
-    evolve: evolve,
+    decide:,
+    evolve:,
   )
 }
 ```
 
-`Decider` is inspired by FModel: it is a small pure domain component made from
-three things only: initial state, a decision function, and an evolution function.
-It does not know about SQLite, KurrentDB, projections, subscriptions, HTTP, retries, or
-repositories.
-
-You can test a decider without any storage:
+Deciders are easy to test without any storage:
 
 ```gleam
 factos.compute_events(
@@ -92,14 +121,15 @@ factos.compute_events(
 )
 ```
 
-## Command Context
+### Command Context Consistency
 
-The command context is not a `User` aggregate. It is the facts relevant to the
-decision: has this username been reserved or registered?
+The command context is the set of facts required to make one decision.
+
+For registering a username, the command does not need every event for a `User`
+object. It only needs facts that can make that username unavailable, such as
+`UsernameReserved` and `UserRegistered` for the same username.
 
 ```gleam
-import factos
-
 pub fn username_context(username: String) -> factos.Query {
   factos.query([
     factos.query_item(
@@ -113,143 +143,100 @@ pub fn username_context(username: String) -> factos.Query {
 }
 ```
 
-Query items are OR-combined. Within one item, event types are OR-combined and
-tags are AND-combined.
+Factos query semantics are deliberately simple:
 
-## Tags
+1. `factos.query([])` becomes `AllEvents`.
+2. Query items are OR-combined.
+3. Within one query item, event types are OR-combined.
+4. Within one query item, tags are AND-combined.
+5. Empty types in an item match any event type.
+6. Empty tags in an item match any tags.
 
-Tags are an explicit query contract. If a future command needs to select events
-by username, account, invoice number, or product, that value must be exposed as a
-tag when the event is written.
+When a backend reads a context it returns a `factos.Context` containing:
+
+1. the query that defined the context,
+2. the folded decision state,
+3. the matching recorded events,
+4. the highest observed sequence position, and
+5. an append condition: `FailIfEventsMatch(query, after: position)`.
+
+That append condition captures Command Context Consistency: append the newly
+decided facts only if no facts matching the command context appeared after the
+position used for the decision.
+
+### Dynamic Consistency Boundary Tags
+
+Dynamic Consistency Boundary (DCB) applies the same context-first consistency
+principle through a tag-based event-store contract. Event data is opaque to the
+store, so anything that must be queryable for context reads or consistency checks
+has to be exposed as an event type or tag when writing the event.
 
 ```gleam
 factos.tag("username:renata")
 factos.tag("account:abc123")
+factos.tag("restaurant")
+factos.tag("sku:burger")
 ```
 
-This is intentionally opinionated. Tags duplicate selected payload information,
-but they make consistency and query needs visible at the event-store boundary.
+Tags intentionally duplicate selected payload information. That duplication is
+the contract: it makes future command-context queries visible at the event-store
+boundary instead of hiding them inside opaque payloads.
 
-## Backends
+### Stream Consistency Is Still Supported
 
-Factos is split into a small core package and backend packages:
+Factos also supports stream-based workflows through `load_stream` and
+`dispatch_stream` in the backends. This is useful when a single stream really is
+the right boundary for a decision.
 
-1. `factos` contains the store-independent domain primitives: `Decider`, `View`, `Query`, `Tag`, `Recorded`, and `Context`.
-2. `backends/factos_sqlight` provides module `factos/sqlight` for SQLite via the `sqlight` package.
-3. `backends/factos_kurrentdb_erlang` provides module `factos/kurrentdb` for KurrentDB on Erlang.
+Stream revision checks are not the definition of Event Sourcing. They are one
+possible consistency strategy. They can over-conflict when unrelated events share
+the same stream, and they can under-model rules that require facts from multiple
+streams.
 
-Backends own their storage codecs and storage errors. The core package does not depend on either SQLite or KurrentDB.
+## Core Library: `factos`
 
-## Codecs
-
-The app owns encoding and decoding. Backend codecs return both the domain event
-and the event-store metadata needed by the context API.
+Import the core package when you want pure domain components and shared event
+metadata types.
 
 ```gleam
-import factos/sqlight as factos_sqlight
-import sqlight
-
-pub fn codec() -> factos_sqlight.EventCodec(Event, DecodeError) {
-  factos_sqlight.EventCodec(encode: encode, decode: decode_event)
-}
+import factos
 ```
 
-For SQLite, `encode` returns a `factos_sqlight.Proposed` with an id, domain event,
-event type, tags, and encoded bytes. `decode` returns a `factos.Decoded` with the
-domain event, event type, and tags read from the stored event.
+The core library provides:
 
-The library does not force one JSON shape for tags. In a real app, store tags in
-custom metadata or payload fields consistently, and decode them at the boundary.
+1. `EventType` and `Tag` wrappers for store-visible event metadata.
+2. `Query` and `QueryItem` for command contexts.
+3. `SequencePosition` for global event-log positions.
+4. `AppendCondition` for context-stability requirements.
+5. `Decider` for command-side decisions.
+6. `View` for query-side projection folds.
+7. `Decoded`, `Recorded`, `Context`, and `LoadedStream` records used by backends.
 
-## SQLite Backend
+### Pure Command Computation
+
+Use `compute_events` when you already have relevant event history and want to test
+or run a decider without storage:
 
 ```gleam
-import factos/sqlight as factos_sqlight
-
-use connection <- sqlight.with_connection("file:events.sqlite3")
-let assert Ok(Nil) = factos_sqlight.migrate(connection)
-
-factos_sqlight.dispatch_context(
-  connection,
-  stream: "facts",
-  query: username_context("renata"),
+factos.compute_events(
   decider: registration_decider(),
-  codec: codec(),
+  events: [UsernameReserved("renata")],
   command: RegisterUser("renata"),
 )
 ```
 
-The SQLite backend stores an append-only `factos_events` table and uses `BEGIN IMMEDIATE` while dispatching commands. It can enforce `FailIfEventsMatch(query, after)` inside the same SQLite transaction.
-
-## Reading A Context
+Use `compute_state` when you want to apply the events produced by a decision to
+an existing state:
 
 ```gleam
-factos_sqlight.read_context(
-  connection,
-  query: username_context("renata"),
+factos.compute_state(
   decider: registration_decider(),
-  codec: codec(),
-)
-```
-
-Backend `read_context` functions load events, decode them, filter them by the
-full query, fold state with the decider, and return a `factos.Context`.
-
-The returned context includes:
-
-1. The folded decision state.
-2. The matching recorded events.
-3. The highest observed sequence position.
-4. A DCB-style append condition: `FailIfEventsMatch(query, after: position)`.
-
-## Appending
-
-The ideal append condition is:
-
-```gleam
-factos.FailIfEventsMatch(query, after: position)
-```
-
-That means: append these new facts only if no facts matching the command context
-appeared after the position used for the decision.
-
-The SQLite backend enforces this condition transactionally. The KurrentDB backend
-models the same condition, but returns `UnsupportedAppendCondition` for it because
-regular KurrentDB append checks stream revisions, not arbitrary event-type/tag
-queries.
-
-```gleam
-factos_sqlight.dispatch_context(
-  connection,
-  stream: "facts",
-  query: username_context("renata"),
-  decider: registration_decider(),
-  codec: codec(),
+  current: option.None,
   command: RegisterUser("renata"),
 )
 ```
 
-Use this shape for stores that support DCB-style atomic append conditions.
-
-## Stream Consistency
-
-KurrentDB can safely protect a single stream with expected revision checks. This
-is still useful when a stream is the right consistency boundary.
-
-```gleam
-factos_sqlight.dispatch_stream(
-  connection,
-  stream: "user-renata",
-  decider: registration_decider(),
-  codec: codec(),
-  command: RegisterUser("renata"),
-)
-```
-
-This is aggregate-stream style consistency. It is not the definition of Event
-Sourcing, and it may over-conflict when unrelated events share the same stream.
-
-## Views
+### Projection Computation
 
 `View` is the projection-side equivalent of a decider's `evolve` function. It is
 also pure and store-independent.
@@ -260,6 +247,7 @@ let registrations =
     case event {
       UserRegistered(_) -> count + 1
       UsernameReserved(_) -> count
+      DisplayNameChanged(_, _) -> count
     }
   })
 
@@ -272,45 +260,226 @@ factos.project(view: registrations, events: [
 Views can be merged when they consume the same event type:
 
 ```gleam
-let dashboard = factos.merge_views(registrations, reservations)
+let dashboard = factos.merge_views(registrations, display_name_changes)
 ```
 
-Factos intentionally stops at pure projection computation. It does not provide a
-materialized-view repository abstraction yet; persistence and delivery choices
-belong outside the domain component.
+Factos intentionally stops at pure projection computation. Materialized view
+storage, catch-up subscriptions, delivery retries, and read-model rebuilds belong
+to application or backend-specific code.
 
-## KurrentDB Backend Tradeoffs
+## SQLite Backend: `factos_sqlight`
 
-KurrentDB support available through `factos_kurrentdb_erlang`:
+The SQLite backend stores events in an append-only table named `factos_events` and
+uses `BEGIN IMMEDIATE` while dispatching commands. That lets it enforce
+`FailIfEventsMatch(query, after)` transactionally in the same database that stores
+events.
 
-1. Read a single stream.
-2. Append to a stream with `NoStream`, `Revision(n)`, `StreamExists`, or `Any`.
-3. Read `$all` with event-type or stream-name filters.
+```gleam
+import factos/factos_sqlight
+import sqlight
 
-Newer KurrentDB versions also support secondary and user-defined indexes that
-can be consumed through `$all` stream-prefix filters such as `$idx-et-...` or
-`$idx-user-...`. Those improve reads, but the docs describe secondary indexes as
-eventually consistent. They should not be treated as a command-decision
-consistency guarantee unless the write path can atomically enforce the same
-condition.
+use connection <- sqlight.with_connection("events.sqlite3")
+let assert Ok(Nil) = factos_sqlight.migrate(connection)
+```
 
-## Inspired By FModel
+The schema contains:
 
-Factos borrows FModel's useful core idea: model behavior as pure data structures
-that hold functions (`Decider`, `View`) and keep infrastructure outside them.
+1. `position`: monotonically increasing SQLite row position.
+2. `id`: application-provided event id.
+3. `stream`: stream name used for stream-based dispatch.
+4. `revision`: per-stream revision.
+5. `type`: event type name.
+6. `tags`: newline-separated tag text.
+7. `data`: opaque application-encoded bytes.
 
-Factos intentionally does not copy these FModel parts yet:
+The table enforces `unique(stream, revision)` and indexes stream revisions and
+positions.
 
-1. `Aggregate` wrappers, because the package is trying not to make aggregates the
-   center of the model.
-2. Generic repository traits, because Gleam code can pass concrete functions and
-   records without committing to one application architecture.
-3. Sagas/process managers, because they are event-driven messaging/workflow
-   concerns and should remain separate from the event-sourcing core until a real
-   use case needs them.
+### SQLite Codecs
 
-## Development
+Your application owns encoding and decoding. `factos_sqlight.EventCodec` keeps the
+backend generic over event payloads and domain event types.
+
+```gleam
+pub fn codec() -> factos_sqlight.EventCodec(Event, DecodeError) {
+  factos_sqlight.EventCodec(encode: encode, decode: decode)
+}
+
+fn encode(event: Event) -> factos_sqlight.Proposed(Event) {
+  factos_sqlight.Proposed(
+    id: "event-" <> event.username,
+    event: event,
+    type_: factos.event_type("UserRegistered"),
+    tags: [factos.tag("username:" <> event.username)],
+    data: bit_array.from_string(event.username),
+  )
+}
+```
+
+The encoder returns the domain event, event type, tags, and bytes to persist. The
+decoder receives the stored row and must return `factos.Decoded(event)` with the
+domain event, event type, and tags that should participate in query matching.
+
+### SQLite Context Dispatch
+
+Use `dispatch_context` when a command's consistency boundary is a query over event
+types and tags rather than a single stream.
+
+```gleam
+factos_sqlight.dispatch_context(
+  connection,
+  stream: "facts",
+  query: username_context("renata"),
+  decider: registration_decider(),
+  codec: codec(),
+  command: RegisterUser("renata"),
+)
+```
+
+`dispatch_context` performs the full read-decide-append flow inside a transaction:
+
+1. begin an immediate SQLite transaction,
+2. read matching events,
+3. fold the decision state,
+4. run the decider,
+5. check whether matching events appeared after the observed position,
+6. append produced events to the target stream, and
+7. commit or roll back.
+
+### SQLite Stream Dispatch
+
+Use `dispatch_stream` when the stream is the intended consistency boundary.
+
+```gleam
+factos_sqlight.dispatch_stream(
+  connection,
+  stream: "user-renata",
+  decider: registration_decider(),
+  codec: codec(),
+  command: RegisterUser("renata"),
+)
+```
+
+The backend loads the stream, folds state, decides, and appends only if the
+stream revision still matches the revision that was loaded.
+
+## KurrentDB Erlang Backend: `factos_kurrentdb_erlang`
+
+The KurrentDB backend integrates Factos with the Erlang-target KurrentDB client.
+It supports stream reads, stream appends with expected revisions, and context
+reads from `$all` using event-type filters.
+
+```gleam
+import factos/factos_kurrentdb_erlang
+import kurrentdb
+import kurrentdb_erlang
+
+let assert Ok(client) =
+  kurrentdb.from_connection_string(
+    "kurrentdb://admin:changeit@localhost:2113?tls=true",
+  )
+
+let assert Ok(connection) =
+  kurrentdb_erlang.new(client)
+  |> kurrentdb_erlang.verify_ca_certificate_file("certs/ca.crt")
+  |> kurrentdb_erlang.start(option.None)
+```
+
+### KurrentDB Codecs
+
+`factos_kurrentdb_erlang.EventCodec` adapts between domain events and
+`append_to_stream.Event` values from the KurrentDB client.
+
+```gleam
+pub fn codec() -> factos_kurrentdb_erlang.EventCodec(Event, DecodeError) {
+  factos_kurrentdb_erlang.EventCodec(encode: encode, decode: decode)
+}
+```
+
+The encoder returns `Proposed(event, type_, tags, message)`. The `message` is the
+actual KurrentDB append event. The decoder receives a KurrentDB recorded event and
+returns a `factos.Decoded(event)`.
+
+### KurrentDB Stream Dispatch
+
+KurrentDB's regular append API can protect a stream revision. Use
+`dispatch_stream` for that flow.
+
+```gleam
+factos_kurrentdb_erlang.dispatch_stream(
+  connection,
+  stream: "user-renata",
+  decider: registration_decider(),
+  codec: codec(),
+  command: RegisterUser("renata"),
+  timeout: 10_000,
+)
+```
+
+Empty streams map to `factos.NoEvents`; loaded streams map to
+`factos.CurrentRevision(n)`. Appends use KurrentDB expected-revision checks.
+
+### KurrentDB Context Reads
+
+`read_context` can read from `$all`. It translates the event types in a
+`factos.Query` into a KurrentDB `$all` event-type prefix filter, decodes events,
+then applies full Factos query matching locally, including tags.
+
+```gleam
+factos_kurrentdb_erlang.read_context(
+  connection,
+  query: username_context("renata"),
+  decider: registration_decider(),
+  codec: codec(),
+  timeout: 10_000,
+)
+```
+
+The returned context still contains `FailIfEventsMatch(query, after: position)`.
+However, KurrentDB's regular append operation cannot atomically enforce arbitrary
+event-type/tag query conditions. For that reason `dispatch_context` returns
+`UnsupportedAppendCondition` for `FailIfEventsMatch`.
+
+This is intentional documentation of the tradeoff: KurrentDB stream revision
+checks are useful, but they are not the same as a DCB-style query-conditioned
+append. If your consistency rule is genuinely context-based across streams, you
+need a write path that can atomically enforce that context condition.
+
+## Example
+
+The `examples/src/order_workflow.gleam` file contains a restaurant order workflow
+using `factos_sqlight`. It demonstrates:
+
+1. domain commands and events,
+2. a custom state machine,
+3. domain-specific errors,
+4. stream dispatch for one order,
+5. application-owned encoding and decoding, and
+6. a projection view for kitchen summary data.
+
+Run it from the examples package:
 
 ```sh
-gleam test
+cd examples
+gleam run
 ```
+
+## Tradeoffs
+
+Factos is a prototype. It deliberately leaves many production concerns outside the
+core package:
+
+1. event schema evolution,
+2. snapshots,
+3. subscriptions,
+4. projection repositories,
+5. retry policies,
+6. side-effect orchestration,
+7. idempotency policies beyond event ids,
+8. serialization format choices, and
+9. distributed deployment concerns.
+
+Those are real engineering problems, but they are separate from the core Event
+Sourcing definition. Factos keeps the starting point simple: persist accepted
+facts, derive temporary decision state from relevant history, and record new facts
+only if that relevant history is still valid.

@@ -1,5 +1,11 @@
 name = "factos_sqlight"
 version = "1.0.0"
+description = "SQLite backend for Factos context-first Event Sourcing using sqlight."
+licences = ["Apache-2.0"]
+links = [
+  { title = "Factos", href = "https://factos.hexdocs.pm" },
+  { title = "Simply Event Sourcing", href = "https://ricofritzsche.me/simply-event-sourcing/" },
+]
 
 [dependencies]
 factos = { path = "../.." }
