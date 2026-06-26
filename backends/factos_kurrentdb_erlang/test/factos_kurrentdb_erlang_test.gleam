@@ -206,6 +206,7 @@ fn encode_counter_event(
         event: event,
         type_: factos.event_type(event_type),
         tags: [factos.tag("counter:load")],
+        metadata: factos.empty_metadata(),
         message: append_to_stream.binary_event(
           uuid: uuid.v4(),
           type_: event_type,
@@ -229,13 +230,12 @@ fn decode_counter_event(
         int.parse(text)
         |> result.map_error(fn(_) { InvalidData }),
       )
-      Ok(
-        factos.Decoded(
-          event: Incremented(value),
-          type_: factos.event_type(event_type),
-          tags: [factos.tag("counter:load")],
-        ),
-      )
+      Ok(factos.Decoded(
+        event: Incremented(value),
+        type_: factos.event_type(event_type),
+        tags: [factos.tag("counter:load")],
+        metadata: factos.empty_metadata(),
+      ))
     }
     Ok(_) | Error(_) -> Error(UnknownEvent)
   }

@@ -283,6 +283,7 @@ fn encode_event(event: Event) -> factos_pog.Proposed(Event) {
         event: event,
         type_: factos.event_type("TicketSold"),
         tags: [factos.tag("event:" <> event_id)],
+        metadata: factos.empty_metadata(),
         data: bit_array.from_string(buyer),
       )
   }
@@ -301,6 +302,7 @@ fn decode_event(
         event: TicketSold(buyer),
         type_: stored.type_,
         tags: stored.tags,
+        metadata: stored.metadata,
       ))
     }
     type_name -> Error(UnknownEventType(type_name))

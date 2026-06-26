@@ -200,6 +200,7 @@ fn encode(event: Event) -> factos_pog.Proposed(Event) {
     event: event,
     type_: factos.event_type("UserRegistered"),
     tags: [factos.tag("username:" <> event.username)],
+    metadata: factos.empty_metadata(),
     data: bit_array.from_string(event.username),
   )
 }
@@ -217,6 +218,7 @@ fn decode(
         event: UserRegistered(username),
         type_: stored.type_,
         tags: stored.tags,
+        metadata: stored.metadata,
       ))
     }
     _ -> Error(UnknownEvent)
@@ -306,6 +308,7 @@ fn encode_counter_event(
         event: event,
         type_: factos.event_type("Incremented"),
         tags: [factos.tag("counter:load")],
+        metadata: factos.empty_metadata(),
         data: bit_array.from_string(int.to_string(value)),
       )
   }
@@ -328,6 +331,7 @@ fn decode_counter_event(
         event: Incremented(value),
         type_: stored.type_,
         tags: stored.tags,
+        metadata: stored.metadata,
       ))
     }
     _ -> Error(UnknownEvent)

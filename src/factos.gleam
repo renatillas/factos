@@ -44,6 +44,14 @@ pub opaque type Tag {
   Tag(String)
 }
 
+/// Application metadata attached to a recorded event.
+///
+/// Metadata is not part of query matching. It is intended for operational and
+/// audit context such as correlation ids, causation ids, actors, and timestamps.
+pub opaque type Metadata {
+  Metadata(List(#(String, String)))
+}
+
 pub type Query {
   /// Match every recorded event.
   AllEvents
@@ -128,8 +136,8 @@ pub type Decoded(event) {
   ///
   /// Backends use codecs supplied by the application. The decoded value includes
   /// the domain event plus the event type and tags that should participate in
-  /// query matching.
-  Decoded(event: event, type_: EventType, tags: List(Tag))
+  /// query matching, along with non-query event metadata.
+  Decoded(event: event, type_: EventType, tags: List(Tag), metadata: Metadata)
 }
 
 pub type Recorded(event) {
@@ -145,6 +153,7 @@ pub type Recorded(event) {
     position: SequencePosition,
     type_: EventType,
     tags: List(Tag),
+    metadata: Metadata,
     event: event,
   )
 }
@@ -197,6 +206,22 @@ pub fn tag(value: String) -> Tag {
 pub fn tag_value(tag: Tag) -> String {
   let Tag(value) = tag
   value
+}
+
+/// No event metadata.
+pub fn empty_metadata() -> Metadata {
+  Metadata([])
+}
+
+/// Build event metadata from key/value pairs.
+pub fn metadata(entries: List(#(String, String))) -> Metadata {
+  Metadata(entries)
+}
+
+/// Unwrap event metadata entries.
+pub fn metadata_entries(metadata: Metadata) -> List(#(String, String)) {
+  let Metadata(entries) = metadata
+  entries
 }
 
 /// Build a query from query items.

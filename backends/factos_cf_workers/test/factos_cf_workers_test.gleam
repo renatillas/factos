@@ -287,6 +287,7 @@ fn encode(event: Event) -> backend.Proposed(Event) {
         event: event,
         type_: factos.event_type("reserved"),
         tags: [factos.tag("name:" <> name)],
+        metadata: factos.empty_metadata(),
         data: name,
       )
   }
@@ -301,6 +302,7 @@ fn decode(
         event: Reserved(stored.data),
         type_: stored.type_,
         tags: stored.tags,
+        metadata: stored.metadata,
       ))
     other -> Error(UnknownEvent(other))
   }

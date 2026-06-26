@@ -702,6 +702,7 @@ fn proposed(
     event: event,
     type_: factos.event_type(type_name),
     tags: [factos.tag("restaurant"), ..tags],
+    metadata: factos.empty_metadata(),
     data: bit_array.from_string(fields_to_payload(fields)),
   )
 }
@@ -717,7 +718,12 @@ fn decode_event(
     |> result.map(payload_to_fields)
 
   use event <- result.try(decode_fields(type_name, fields))
-  Ok(factos.Decoded(event: event, type_: stored.type_, tags: stored.tags))
+  Ok(factos.Decoded(
+    event: event,
+    type_: stored.type_,
+    tags: stored.tags,
+    metadata: stored.metadata,
+  ))
 }
 
 fn decode_fields(

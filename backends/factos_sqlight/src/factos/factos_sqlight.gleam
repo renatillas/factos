@@ -35,6 +35,7 @@ pub type Proposed(event) {
     event: event,
     type_: factos.EventType,
     tags: List(factos.Tag),
+    metadata: factos.Metadata,
     data: BitArray,
   )
 }
@@ -52,6 +53,7 @@ pub type StoredEvent {
     revision: Int,
     type_: factos.EventType,
     tags: List(factos.Tag),
+    metadata: factos.Metadata,
     data: BitArray,
   )
 }
@@ -107,6 +109,7 @@ pub fn migrate(connection: sqlight.Connection) -> Result(Nil, Error(_, _)) {
       revision integer not null,
       type text not null,
       tags text not null,
+      metadata text not null default '',
       data blob not null,
       unique(stream, revision)
     );
@@ -370,12 +373,12 @@ fn insert_events(
     [] -> Ok(Append(current_revision: revision - 1, position: position))
     [event, ..rest] -> {
       let EventCodec(encode, _) = codec
-      let Proposed(id, _, type_, tags, data) = encode(event)
+      let Proposed(id, _, type_, tags, metadata, data) = encode(event)
       use positions <- result.try(
         sqlight.query(
           "
-          insert into factos_events (id, stream, revision, type, tags, data)
-          values (?, ?, ?, ?, ?, ?)
+          insert into factos_events (id, stream, revision, type, tags, metadata, data)
+          values (?, ?, ?, ?, ?, ?, ?)
           returning position
           ",
           on: connection,
@@ -385,6 +388,7 @@ fn insert_events(
             sqlight.int(revision),
             sqlight.text(factos.event_type_name(type_)),
             sqlight.text(tags_to_text(tags)),
+            sqlight.text(metadata_to_text(metadata)),
             sqlight.blob(data),
           ],
           expecting: int_field_decoder(),
@@ -414,7 +418,7 @@ fn read_matching_events(
 ) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
   use rows <- result.try(
     sqlight.query(
-      "select position, id, stream, revision, type, tags, data from factos_events order by position",
+      "select position, id, stream, revision, type, tags, metadata, data from factos_events order by position",
       on: connection,
       with: [],
       expecting: stored_event_decoder(),
@@ -432,7 +436,7 @@ fn read_stream_events(
 ) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
   use rows <- result.try(
     sqlight.query(
-      "select position, id, stream, revision, type, tags, data from factos_events where stream = ? order by revision",
+      "select position, id, stream, revision, type, tags, metadata, data from factos_events where stream = ? order by revision",
       on: connection,
       with: [sqlight.text(stream_name)],
       expecting: stored_event_decoder(),
@@ -462,8 +466,8 @@ fn decode_row(
 ) -> Result(factos.Recorded(event), Error(domain_error, decode_error)) {
   let EventCodec(_, decode_event) = codec
   use decoded <- result.try(decode_event(row) |> result.map_error(DecodeError))
-  let factos.Decoded(event, type_, tags) = decoded
-  let StoredEvent(position, id, stream, revision, _, _, _) = row
+  let factos.Decoded(event, type_, tags, metadata) = decoded
+  let StoredEvent(position, id, stream, revision, _, _, _, _) = row
 
   Ok(factos.Recorded(
     id: id,
@@ -472,6 +476,7 @@ fn decode_row(
     position: factos.SequencePosition(position),
     type_: type_,
     tags: tags,
+    metadata: metadata,
     event: event,
   ))
 }
@@ -483,7 +488,8 @@ fn stored_event_decoder() -> decode.Decoder(StoredEvent) {
   use revision <- decode.field(3, decode.int)
   use type_name <- decode.field(4, decode.string)
   use tags <- decode.field(5, decode.string)
-  use data <- decode.field(6, decode.bit_array)
+  use metadata <- decode.field(6, decode.string)
+  use data <- decode.field(7, decode.bit_array)
   decode.success(StoredEvent(
     position: position,
     id: id,
@@ -491,6 +497,7 @@ fn stored_event_decoder() -> decode.Decoder(StoredEvent) {
     revision: revision,
     type_: factos.event_type(type_name),
     tags: tags_from_text(tags),
+    metadata: metadata_from_text(metadata),
     data: data,
   ))
 }
@@ -561,6 +568,7 @@ fn matches_query_parts(
       position: factos.NoPosition,
       type_: type_,
       tags: tags,
+      metadata: factos.empty_metadata(),
       event: Nil,
     ),
     query,
@@ -607,5 +615,28 @@ fn tags_from_text(tags: String) -> List(factos.Tag) {
   case string.is_empty(tags) {
     True -> []
     False -> tags |> string.split(on: "\n") |> list.map(factos.tag)
+  }
+}
+
+fn metadata_to_text(metadata: factos.Metadata) -> String {
+  metadata
+  |> factos.metadata_entries
+  |> list.map(fn(entry) { entry.0 <> "=" <> entry.1 })
+  |> string.join(with: "\n")
+}
+
+fn metadata_from_text(metadata: String) -> factos.Metadata {
+  case string.is_empty(metadata) {
+    True -> factos.empty_metadata()
+    False ->
+      metadata
+      |> string.split(on: "\n")
+      |> list.filter_map(fn(entry) {
+        case string.split(entry, on: "=") {
+          [key, value] -> Ok(#(key, value))
+          _ -> Error(Nil)
+        }
+      })
+      |> factos.metadata
   }
 }

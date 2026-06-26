@@ -34,6 +34,7 @@ pub type Proposed(event) {
     event: event,
     type_: factos.EventType,
     tags: List(factos.Tag),
+    metadata: factos.Metadata,
     message: append_to_stream.Event,
   )
 }
@@ -540,7 +541,7 @@ fn decode_recorded(
     |> result.map_error(DecodeError),
   )
 
-  let factos.Decoded(event, type_, tags) = decoded
+  let factos.Decoded(event, type_, tags, metadata) = decoded
   Ok(factos.Recorded(
     id: uuid.to_string(recorded_event.id),
     stream: recorded_event.stream,
@@ -548,6 +549,7 @@ fn decode_recorded(
     position: factos.SequencePosition(recorded_event.commit_position),
     type_: type_,
     tags: tags,
+    metadata: metadata,
     event: event,
   ))
 }

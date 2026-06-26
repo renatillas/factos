@@ -32,6 +32,7 @@ pub type Proposed(event) {
     event: event,
     type_: factos.EventType,
     tags: List(factos.Tag),
+    metadata: factos.Metadata,
     data: String,
   )
 }
@@ -45,6 +46,7 @@ pub type StoredEvent {
     revision: Int,
     type_: factos.EventType,
     tags: List(factos.Tag),
+    metadata: factos.Metadata,
     data: String,
   )
 }
@@ -101,6 +103,7 @@ pub fn migrate(database: d1.Database) -> Promise(Result(Nil, Error(_, _))) {
       revision integer not null,
       type text not null,
       tags text not null,
+      metadata text not null,
       data text not null,
       unique(stream, revision)
     )
@@ -326,7 +329,7 @@ fn read_matching_events(
 ) {
   d1.prepare(
     database,
-    "select position, id, stream, revision, type, tags, data from factos_events order by position",
+    "select position, id, stream, revision, type, tags, metadata, data from factos_events order by position",
   )
   |> d1.raw
   |> promise.map(fn(result) {
@@ -345,7 +348,7 @@ fn read_stream_events(
 ) {
   d1.prepare(
     database,
-    "select position, id, stream, revision, type, tags, data from factos_events where stream = ? order by revision",
+    "select position, id, stream, revision, type, tags, metadata, data from factos_events where stream = ? order by revision",
   )
   |> d1.bind([stream_name])
   |> d1.raw
@@ -392,8 +395,8 @@ fn decode_row(
   use decoded <- result.try(
     decode_event(stored) |> result.map_error(DecodeError),
   )
-  let factos.Decoded(event, type_, tags) = decoded
-  let StoredEvent(position, id, stream, revision, _, _, _) = stored
+  let factos.Decoded(event, type_, tags, metadata) = decoded
+  let StoredEvent(position, id, stream, revision, _, _, _, _) = stored
 
   Ok(factos.Recorded(
     id: id,
@@ -402,6 +405,7 @@ fn decode_row(
     position: factos.SequencePosition(position),
     type_: type_,
     tags: tags,
+    metadata: metadata,
     event: event,
   ))
 }
@@ -415,7 +419,8 @@ fn decode_stored_event(
   use revision <- result.try(decode_int_field(row, 3))
   use type_name <- result.try(decode_string_field(row, 4))
   use tags <- result.try(decode_string_field(row, 5))
-  use data <- result.try(decode_string_field(row, 6))
+  use metadata <- result.try(decode_string_field(row, 6))
+  use data <- result.try(decode_string_field(row, 7))
 
   Ok(StoredEvent(
     position: position,
@@ -424,6 +429,7 @@ fn decode_stored_event(
     revision: revision,
     type_: factos.event_type(type_name),
     tags: tags_from_text(tags),
+    metadata: metadata_from_text(metadata),
     data: data,
   ))
 }
@@ -477,7 +483,7 @@ fn append_sql(
     })
 
   let sql =
-    "insert into factos_events (id, stream, revision, type, tags, data) "
+    "insert into factos_events (id, stream, revision, type, tags, metadata, data) "
     <> string.join(list.map(rows, fn(row) { row.0 }), with: " union all ")
     <> " returning position, revision"
 
@@ -493,7 +499,7 @@ fn append_select_sql(
   index: Int,
 ) -> #(String, List(String)) {
   let EventCodec(encode, _) = codec
-  let Proposed(id, _, type_, tags, data) = encode(event)
+  let Proposed(id, _, type_, tags, metadata, data) = encode(event)
   let base_values = [
     id,
     stream_name,
@@ -501,12 +507,13 @@ fn append_select_sql(
     int.to_string(index + 1),
     factos.event_type_name(type_),
     tags_to_text(tags),
+    metadata_to_text(metadata),
     data,
   ]
 
   let #(condition, condition_values) = append_condition_sql(stream_name, mode)
   #(
-    "select ?, ?, (select coalesce(max(revision), -1) from factos_events where stream = ?) + cast(? as integer), ?, ?, ? where "
+    "select ?, ?, (select coalesce(max(revision), -1) from factos_events where stream = ?) + cast(? as integer), ?, ?, ?, ? where "
       <> condition,
     list.append(base_values, condition_values),
   )
@@ -650,5 +657,28 @@ fn tags_from_text(tags: String) -> List(factos.Tag) {
       |> string.split(on: "\n")
       |> list.filter(fn(tag) { !string.is_empty(tag) })
       |> list.map(factos.tag)
+  }
+}
+
+fn metadata_to_text(metadata: factos.Metadata) -> String {
+  metadata
+  |> factos.metadata_entries
+  |> list.map(fn(entry) { entry.0 <> "=" <> entry.1 })
+  |> string.join(with: "\n")
+}
+
+fn metadata_from_text(metadata: String) -> factos.Metadata {
+  case string.is_empty(metadata) {
+    True -> factos.empty_metadata()
+    False ->
+      metadata
+      |> string.split(on: "\n")
+      |> list.filter_map(fn(entry) {
+        case string.split(entry, on: "=") {
+          [key, value] -> Ok(#(key, value))
+          _ -> Error(Nil)
+        }
+      })
+      |> factos.metadata
   }
 }
