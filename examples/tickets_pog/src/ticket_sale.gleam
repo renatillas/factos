@@ -139,13 +139,12 @@ fn spawn_purchase(
   connection: pog.Connection,
   attempt: Int,
 ) -> Nil {
-  let _ =
-    process.spawn(fn() {
-      process.send(
-        workers,
-        PurchaseFinished(attempt, purchase(connection, attempt)),
-      )
-    })
+  process.spawn(fn() {
+    process.send(
+      workers,
+      PurchaseFinished(attempt, purchase(connection, attempt)),
+    )
+  })
   Nil
 }
 
@@ -230,7 +229,7 @@ fn finalize_summary(
     codec: ticket_codec(),
   ))
 
-  echo Ok(SaleSummary(
+  Ok(SaleSummary(
     attempts: summary.attempts,
     accepted: summary.accepted,
     sold_out: summary.sold_out,
