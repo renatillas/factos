@@ -57,7 +57,7 @@ pub fn dispatch_stream_appends_and_loads_events_test() -> Promise(Nil) {
     }
   }
 
-  use append_result <- promise.await(backend.dispatch_stream(
+  use append_result <- promise.await(backend.dispatch(
     test_database.database,
     stream: "reservation-renata",
     decider: reservation_decider(),
@@ -132,7 +132,7 @@ pub fn dispatch_context_rejects_changed_context_test() -> Promise(Nil) {
       ]),
     ])
 
-  use first_result <- promise.await(backend.dispatch_context(
+  use first_result <- promise.await(backend.dispatch_with_context(
     test_database.database,
     stream: "reservation-renata",
     query: query,
@@ -155,7 +155,7 @@ pub fn dispatch_context_rejects_changed_context_test() -> Promise(Nil) {
     }
   }
 
-  use second_result <- promise.await(backend.dispatch_context(
+  use second_result <- promise.await(backend.dispatch_with_context(
     test_database.database,
     stream: "reservation-renata-duplicate",
     query: query,
