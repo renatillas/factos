@@ -1,4 +1,4 @@
-name = "factos_cf_workers"
+name = "factos_cf"
 version = "1.0.0"
 description = "Cloudflare Workers D1 backend for Factos context-first Event Sourcing."
 licences = ["Apache-2.0"]
@@ -10,9 +10,10 @@ links = [
 
 [dependencies]
 factos = { path = "../.." }
-cf_workers = { path = "../../../cf_workers" }
+cf = { path = "../../../cf" }
 gleam_javascript = ">= 1.0.0 and < 2.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
+gleam_time = ">= 1.8.0 and < 2.0.0"
 
 [dev_dependencies]
 cf_miniflare = { path = "../../../cf_miniflare" }

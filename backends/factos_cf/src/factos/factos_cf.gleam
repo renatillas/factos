@@ -10,11 +10,13 @@
 //// the append condition and writes in the same SQLite statement, which is the
 //// atomic boundary D1 exposes through prepared statements.
 ////
-//// Side-effect outbox rows (derived from the codec's `side_effects` function) are
-//// inserted atomically alongside events via `d1.batch`, preserving the invariant
-//// that side effects are never lost after a successful event append.
+//// Side effects (extracted from the codec's `side_effects` list) run
+//// **after** a successful append, receiving the domain events that were
+//// just persisted. Dispatch functions wait for side effects to finish before
+//// resolving so callers can safely depend on side-effect continuations such as
+//// outbox inserts and queue notifications.
 
-import cf_workers/d1
+import cf/d1
 import factos
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
@@ -22,6 +24,7 @@ import gleam/int
 import gleam/javascript/array
 import gleam/javascript/promise.{type Promise}
 import gleam/list
+import gleam/pair
 import gleam/result
 import gleam/string
 
@@ -42,8 +45,22 @@ pub type Proposed(event) {
   )
 }
 
+/// A raw event row read from D1 before domain decoding.
+///
+/// Applications normally do not construct this directly. The backend reads
+/// `StoredEvent` values from the `factos_events` table and passes them to the
+/// application's `EventCodec.decode` function.
+///
+/// The fields map directly to stored columns:
+///
+/// - `position` is the global append-only sequence position.
+/// - `id` is the application-provided event identifier.
+/// - `stream` is the logical stream name.
+/// - `revision` is the zero-based stream revision.
+/// - `type_`, `version`, `tags`, and `metadata` are query and compatibility
+///   metadata used by Factos.
+/// - `data` is the application-owned serialized payload.
 pub type StoredEvent {
-  /// A raw event row read from D1 before domain decoding.
   StoredEvent(
     position: Int,
     id: String,
@@ -57,41 +74,65 @@ pub type StoredEvent {
   )
 }
 
-/// An outbox row for a registered side effect.
+/// Backend client bundling a D1 database binding.
 ///
-/// The backend inserts these atomically alongside the events that produced them.
-/// `event_type` identifies the kind of side effect. `stream` is the event stream
-/// name. `payload` is application-owned opaque data, typically JSON with the
-/// arguments the side-effect handler needs.
-pub type OutboxRow {
-  OutboxRow(event_type: String, stream: String, payload: String)
+/// Create this once from the Worker environment's D1 binding and pass it to the
+/// backend functions. Keeping the database inside `Client` makes APIs stable if
+/// more Cloudflare bindings or runtime configuration are needed later.
+pub opaque type Client {
+  Client(database: d1.Database)
 }
 
-pub type EventCodec(event, state, decode_error) {
-  /// Application-owned D1 event codec.
-  ///
-  /// `side_effects` maps each domain event to the outbox rows it triggers.
-  /// It receives the event, the stream name, and the **pre‑event** decision state
-  /// so that contextual data (e.g. customer email) can be captured for the
-  /// side-effect handler without a second read.
+pub fn new(database: d1.Database) -> Client {
+  Client(database)
+}
+
+/// Application-owned codec and side-effect configuration for this D1 backend.
+///
+pub opaque type EventCodec(event, state, decode_error) {
   EventCodec(
     encode: fn(event) -> Proposed(event),
     decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
-    side_effects: fn(event, String, state) -> List(OutboxRow),
+    side_effects: List(fn(List(event)) -> Promise(Nil)),
   )
 }
 
+/// Create a new codec
+/// 
+/// `encode` turns a domain event into a `Proposed` event ready for persistence.
+/// This is where the application chooses event IDs, event types, schema
+/// versions, tags, metadata, and payload serialization.
+///
+/// `decode` turns a stored row back into a domain event. Decode failures are
+/// returned as `DecodeError` and stop load/read flows rather than panicking.
+///
+/// `side_effects` are async hooks that run after a successful append. Each hook
+/// receives the exact domain events that were just persisted. Dispatch functions
+/// await all hooks before resolving, which is important for outbox workflows:
+/// a side effect can insert `factos/outbox.Entry` rows and enqueue the returned
+/// outbox IDs before the command response completes.
+///
+/// Side effects are not part of the append transaction. Events are persisted
+/// first; side effects run after the append succeeds. If a side effect can fail
+/// and must be retried, prefer writing an outbox row and processing it from a
+/// queue or scheduled worker.
+pub fn codec(
+  encode encode: fn(event) -> Proposed(event),
+  decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
+  side_effects side_effects: List(fn(List(event)) -> Promise(Nil)),
+) -> EventCodec(event, state, decode_error) {
+  EventCodec(encode:, decode:, side_effects:)
+}
+
+/// Result of a successful append.
+///
+/// `current_revision` is the new stream revision after the append. For an empty
+/// append it is the current revision that was observed.
+///
+/// `position` is the global event position assigned to the last appended event.
+/// Empty appends use `factos.NoPosition` because no new event row was written.
 pub type Append {
-  /// Result of a successful append.
-  ///
-  /// `outbox_ids` contains the auto-generated IDs of side-effect outbox rows that
-  /// were inserted atomically with the events. The caller may use these IDs to
-  /// enqueue asynchronous processing of those side effects.
-  Append(
-    current_revision: Int,
-    position: factos.SequencePosition,
-    outbox_ids: List(Int),
-  )
+  Append(current_revision: Int, position: factos.SequencePosition)
 }
 
 pub type Error(domain_error, decode_error) {
@@ -122,7 +163,20 @@ type QuerySql {
 }
 
 /// Create or update the D1 schema required by this backend.
-pub fn migrate(database: d1.Database) -> Promise(Result(Nil, Error(_, _))) {
+///
+/// This function is idempotent and safe to run during application startup or in
+/// tests. It creates:
+///
+/// - `factos_events`, the append-only event store.
+/// - indexes used by stream reads, context queries, and projection cursors.
+/// - `event_outbox`, the optional outbox table used by `factos/outbox`.
+///
+/// The outbox table is included here because side-effect hooks commonly need to
+/// insert outbox rows immediately after successful appends. Keeping both tables
+/// in one migration function prevents consumers from accidentally deploying the
+/// event store without the side-effect infrastructure.
+pub fn migrate(client: Client) -> Promise(Result(Nil, Error(_, _))) {
+  let Client(database:) = client
   use _ <- promise.try_await(execute_migration(
     database,
     "
@@ -185,36 +239,56 @@ fn execute_migration(
 }
 
 /// Read and fold the facts selected by a command-context query.
+///
+/// This is the read half of a context-first command flow. It selects all events
+/// matching `query`, decodes them with `codec`, and folds them through the
+/// decider's `evolve` function starting from `decider.initial`.
+///
+/// The returned `factos.Context` includes an append condition that protects the
+/// caller from stale decisions. Pass the same query to `dispatch_with_context`
+/// when you want the backend to perform the full read-decide-append flow.
 pub fn read_context(
-  database: d1.Database,
+  client: Client,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, state, decode_error),
 ) -> Promise(
   Result(factos.Context(event, state), Error(domain_error, decode_error)),
 ) {
-  let factos.Decider(initial, _, evolve) = decider
-
-  read_matching_events(database, query, codec)
-  |> promise.map_try(fn(events) {
-    let position = highest_recorded_position(events)
-    Ok(factos.Context(
-      query:,
-      state: factos.evolve_recorded(
-        initial: initial,
-        events: events,
-        evolve: evolve,
-      ),
+  use events <- promise.map_try(read_matching_events(
+    client.database,
+    query,
+    codec,
+  ))
+  let position = highest_recorded_position(events)
+  Ok(factos.Context(
+    query:,
+    state: factos.evolve_recorded(
+      initial: decider.initial,
       events: events,
-      position: position,
-      append_condition: factos.FailIfEventsMatch(query, position),
-    ))
-  })
+      evolve: decider.evolve,
+    ),
+    events: events,
+    position: position,
+    append_condition: factos.FailIfEventsMatch(query, position),
+  ))
 }
 
 /// Run a full context-first read-decide-append command flow.
-pub fn dispatch_with_context(
-  database: d1.Database,
+///
+/// This function:
+///
+/// - reads all events matching `query`,
+/// - folds them into state,
+/// - asks the decider to produce new events,
+/// - appends those events only if no matching events were added meanwhile,
+/// - runs and awaits codec side effects after a successful append.
+///
+/// Use this for commands whose validity depends on facts outside a single
+/// stream. If the context changed between the read and the append, the function
+/// returns `AppendConditionFailed`.
+pub fn dispatch_with_query(
+  client: Client,
   stream stream_name: String,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
@@ -222,64 +296,79 @@ pub fn dispatch_with_context(
   command command: command,
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
   use context <- promise.try_await(read_context(
-    database,
-    query: query,
-    decider: decider,
-    codec: codec,
+    client,
+    query:,
+    decider:,
+    codec:,
   ))
-  case factos.decide_context(context, command, decider) {
-    Error(error) -> promise.resolve(Error(DomainError(error)))
-    Ok(pair) -> {
-      let #(context, events) = pair
-      let outbox_rows = generate_outbox_rows(events, stream_name, context.state, codec)
-      append_with_condition(
-        database,
-        stream_name,
-        events,
-        codec,
-        context.append_condition,
-        outbox_rows,
-      )
-    }
-  }
+
+  use #(context, events) <- promise.try_await(
+    factos.decide_context(context, command, decider)
+    |> result.map_error(DomainError)
+    |> promise.resolve(),
+  )
+
+  use append <- promise.try_await(append_with_condition(
+    client.database,
+    stream_name,
+    events,
+    codec,
+    context.append_condition,
+  ))
+
+  use _nil_list <- promise.await(run_side_effects(codec, events))
+
+  promise.resolve(Ok(append))
 }
 
 /// Load and fold one stream.
+///
+/// Reads every event from `stream_name`, decodes the rows with `codec`, and
+/// folds them through `decider.evolve`. This does not append events and does not
+/// run side effects.
 pub fn load_stream(
-  database: d1.Database,
+  client: Client,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, state, decode_error),
 ) -> Promise(
   Result(factos.LoadedStream(event, state), Error(domain_error, decode_error)),
 ) {
-  let factos.Decider(initial, _, evolve) = decider
-
-  read_stream_events(database, stream_name, codec)
-  |> promise.map_try(fn(events) {
-    Ok(factos.LoadedStream(
-      stream: stream_name,
-      state: factos.evolve_recorded(
-        initial: initial,
-        events: events,
-        evolve: evolve,
-      ),
-      events: events,
-      revision: stream_revision(events),
-    ))
-  })
+  use events <- promise.map_try(read_stream_events(
+    client.database,
+    stream_name,
+    codec,
+  ))
+  Ok(factos.LoadedStream(
+    stream: stream_name,
+    state: factos.evolve_recorded(
+      initial: decider.initial,
+      events:,
+      evolve: decider.evolve,
+    ),
+    events: events,
+    revision: stream_revision(events),
+  ))
 }
 
 /// Run a stream-based read-decide-append command flow.
+///
+/// This function loads one stream, asks the decider to handle `command`, and
+/// appends the produced events with an expected-revision condition. If another
+/// write has advanced the stream, the append fails with `AppendConditionFailed`.
+///
+/// After a successful append, all codec side effects are awaited before the
+/// returned promise resolves.
 pub fn dispatch(
-  database: d1.Database,
+  client: Client,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, state, decode_error),
   command command: command,
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+  let Client(database:) = client
   use loaded <- promise.try_await(load_stream(
-    database,
+    client,
     stream: stream_name,
     decider: decider,
     codec: codec,
@@ -288,76 +377,29 @@ pub fn dispatch(
   case decide(loaded.state, command) {
     Error(error) -> promise.resolve(Error(DomainError(error)))
     Ok(events) -> {
-      let outbox_rows = generate_outbox_rows(events, stream_name, loaded.state, codec)
-      append_stream_events(
+      use result <- promise.await(append_stream_events(
         database,
         stream_name,
         events,
         codec,
         loaded.revision,
-        outbox_rows,
-      )
+      ))
+      case result {
+        Ok(_) -> {
+          use _ <- promise.await(run_side_effects(codec, events))
+          promise.resolve(result)
+        }
+        Error(_) -> promise.resolve(result)
+      }
     }
   }
 }
 
-/// Run a stream-based read-decide-append command flow and return the loaded
-/// state alongside the append result. This avoids a second read when the caller
-/// needs both the appended metadata and the decision state (e.g., customer
-/// details for a side effect).
-pub fn dispatch_with_state(
-  database: d1.Database,
-  stream stream_name: String,
-  decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, state, decode_error),
-  command command: command,
-) -> Promise(
-  Result(#(Append, factos.LoadedStream(event, state)), Error(
-    domain_error,
-    decode_error,
-  )),
-) {
-  use loaded <- promise.try_await(load_stream(
-    database,
-    stream: stream_name,
-    decider: decider,
-    codec: codec,
-  ))
-  let factos.Decider(_, decide, _) = decider
-  let events = decide(loaded.state, command)
-
-  use append <- promise.try_await(
-    case events {
-      Ok(events) -> {
-        let outbox_rows = generate_outbox_rows(events, stream_name, loaded.state, codec)
-        append_stream_events(
-          database,
-          stream_name,
-          events,
-          codec,
-          loaded.revision,
-          outbox_rows,
-        )
-        |> promise.map(fn(result) {
-          result |> result.map(fn(append) { #(append, loaded) })
-        })
-      }
-      Error(error) -> Error(DomainError(error)) |> promise.resolve
-    },
-  )
-
-  Ok(append) |> promise.resolve
-}
-
-fn generate_outbox_rows(
-  events: List(event),
-  stream_name: String,
-  state: state,
+fn run_side_effects(
   codec: EventCodec(event, state, decode_error),
-) -> List(OutboxRow) {
-  let EventCodec(_, _, side_effects) = codec
-  events
-  |> list.flat_map(fn(event) { side_effects(event, stream_name, state) })
+  events: List(event),
+) -> promise.Promise(List(Nil)) {
+  promise.await_list(list.map(codec.side_effects, fn(f) { f(events) }))
 }
 
 fn append_with_condition(
@@ -366,11 +408,10 @@ fn append_with_condition(
   events: List(event),
   codec: EventCodec(event, state, decode_error),
   condition: factos.AppendCondition,
-  outbox_rows: List(OutboxRow),
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
   case condition {
     factos.NoAppendCondition ->
-      append_events(database, stream_name, events, codec, CurrentStream, outbox_rows)
+      append_events(database, stream_name, events, codec, CurrentStream)
     factos.FailIfEventsMatch(query, after) ->
       append_events(
         database,
@@ -378,7 +419,6 @@ fn append_with_condition(
         events,
         codec,
         ContextCondition(query, after),
-        outbox_rows,
       )
   }
 }
@@ -389,16 +429,8 @@ fn append_stream_events(
   events: List(event),
   codec: EventCodec(event, state, decode_error),
   expected: factos.Revision,
-  outbox_rows: List(OutboxRow),
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
-  append_events(
-    database,
-    stream_name,
-    events,
-    codec,
-    ExpectedStream(expected),
-    outbox_rows,
-  )
+  append_events(database, stream_name, events, codec, ExpectedStream(expected))
 }
 
 fn append_events(
@@ -407,7 +439,6 @@ fn append_events(
   events: List(event),
   codec: EventCodec(event, state, decode_error),
   mode: AppendMode,
-  outbox_rows: List(OutboxRow),
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
   case events {
     [] ->
@@ -415,26 +446,15 @@ fn append_events(
       |> promise.map(fn(result) {
         result
         |> result.map(fn(revision) {
-          Append(current_revision: revision, position: factos.NoPosition, outbox_ids: [])
+          Append(current_revision: revision, position: factos.NoPosition)
         })
       })
     [_, ..] -> {
       let #(sql, values) = append_sql(stream_name, events, codec, mode)
-      let event_statement =
-        d1.prepare(database, sql) |> d1.bind(values)
+      let event_statement = d1.prepare(database, sql) |> d1.bind(values)
 
-      case outbox_rows {
-        [] ->
-          d1.batch(database, [event_statement])
-          |> decode_batch_result(events, mode)
-        [_, ..] -> {
-          let #(outbox_sql, outbox_values) = outbox_insert_sql(outbox_rows)
-          let outbox_statement =
-            d1.prepare(database, outbox_sql) |> d1.bind(outbox_values)
-          d1.batch(database, [event_statement, outbox_statement])
-          |> decode_batch_result(events, mode)
-        }
-      }
+      d1.batch(database, [event_statement])
+      |> decode_batch_result(events, mode)
     }
   }
 }
@@ -444,40 +464,29 @@ fn decode_batch_result(
   events: List(event),
   mode: AppendMode,
 ) -> Promise(Result(Append, Error(domain_error, decode_error))) {
-  batch_result
-  |> promise.map(fn(result) {
-    use run_results <- result.try(result |> result.map_error(StoreError))
-    use first_result <- result.try(
-      array.get(run_results, 0)
-      |> result.replace_error(StoreError("no event insert result in batch")),
-    )
-    let d1.RunResult(success: True, results: event_rows, ..) = first_result
-
-    use appended <- result.try(decode_append_rows(event_rows))
-    case list.length(appended) == list.length(events) {
-      True -> {
-        let outbox_ids = case array.length(run_results) {
-          1 -> Ok([])
-          _ -> {
-            use outbox_result <- result.try(
-              array.get(run_results, 1)
-              |> result.replace_error(StoreError("no outbox insert result in batch")),
-            )
-            let d1.RunResult(success: True, results: outbox_rows, ..) = outbox_result
-            decode_outbox_ids(outbox_rows)
-          }
-        }
-        use outbox_ids <- result.try(outbox_ids)
-        let #(position, revision) = last_append_row(appended)
-        Ok(Append(
-          current_revision: revision,
-          position: factos.SequencePosition(position),
-          outbox_ids: outbox_ids,
-        ))
-      }
-      False -> Error(AppendConditionFailed(append_condition_for(mode)))
-    }
+  use result <- promise.map(batch_result)
+  use run_results <- result.try(result |> result.map_error(StoreError))
+  let run_result_list = array.to_list(run_results)
+  use first_result <- result.try(
+    list.first(run_result_list)
+    |> result.replace_error(StoreError("no event insert result in batch")),
+  )
+  let d1.RunResult(success: success, results: event_rows, ..) = first_result
+  use _ <- result.try(case success {
+    True -> Ok(Nil)
+    False -> Error(StoreError("event insert failed"))
   })
+  use appended <- result.try(decode_append_rows(event_rows))
+  case list.length(appended) == list.length(events) {
+    True -> {
+      let #(position, revision) = last_append_row(appended)
+      Ok(Append(
+        current_revision: revision,
+        position: factos.SequencePosition(position),
+      ))
+    }
+    False -> Error(AppendConditionFailed(append_condition_for(mode)))
+  }
 }
 
 fn read_matching_events(
@@ -487,16 +496,95 @@ fn read_matching_events(
 ) -> Promise(
   Result(List(factos.Recorded(event)), Error(domain_error, decode_error)),
 ) {
+  let #(where_sql, params) = query_to_sql(query)
+
   d1.prepare(
     database,
-    "select position, id, stream, revision, type, version, tags, metadata, data from factos_events order by position",
+    "select position, id, stream, revision, type, version, tags, metadata, data
+     from factos_events " <> where_sql <> " order by position",
   )
+  |> d1.bind(params)
   |> d1.raw
   |> promise.map(fn(result) {
     use rows <- result.try(result |> result.map_error(StoreError))
     decode_rows(rows, codec)
-    |> result.map(list.filter(_, factos.matches_query(_, query)))
   })
+}
+
+fn query_to_sql(query: factos.Query) {
+  case query {
+    factos.AllEvents -> #("", [])
+
+    factos.Query(items) -> {
+      case items {
+        [] -> #("where 1 = 0", [])
+        [_, ..] -> {
+          let built_items =
+            items
+            |> list.map(query_item_to_sql)
+
+          let where_sql =
+            built_items
+            |> list.map(pair.first)
+            |> string.join(" or ")
+
+          let params =
+            built_items
+            |> list.flat_map(pair.second)
+
+          #("where " <> where_sql, params)
+        }
+      }
+    }
+  }
+}
+
+fn query_item_to_sql(item: factos.QueryItem) {
+  let #(types_sql, types_params) = types_to_sql(item.types)
+  let #(tag_sql, tag_params) = tags_to_sql(item.tags)
+
+  #(
+    "(" <> types_sql <> " and " <> tag_sql <> ")",
+    list.append(types_params, tag_params),
+  )
+}
+
+fn types_to_sql(types: List(factos.EventType)) {
+  case types {
+    [] -> #("1 = 1", [])
+
+    [_, ..] -> {
+      let placeholders =
+        types
+        |> list.map(fn(_) { "?" })
+        |> string.join(", ")
+
+      let params =
+        types
+        |> list.map(factos.event_type_name)
+
+      #("type in (" <> placeholders <> ")", params)
+    }
+  }
+}
+
+fn tags_to_sql(tags: List(factos.Tag)) {
+  case tags {
+    [] -> #("1 = 1", [])
+
+    [_, ..] -> {
+      let clauses =
+        tags
+        |> list.map(fn(_) { "instr(tags, char(10) || ? || char(10)) > 0" })
+        |> string.join(" and ")
+
+      let params =
+        tags
+        |> list.map(factos.tag_value)
+
+      #("(" <> clauses <> ")", params)
+    }
+  }
 }
 
 fn read_stream_events(
@@ -604,26 +692,17 @@ fn decode_append_rows(
   |> array.to_list
   |> list.try_map(fn(row) {
     use position <- result.try(
-      decode.run(row, decode.field("position", decode.int))
+      decode.run(row, append_row_decoder())
       |> result.map_error(RowDecodeError),
     )
-    use revision <- result.try(
-      decode.run(row, decode.field("revision", decode.int))
-      |> result.map_error(RowDecodeError),
-    )
-    Ok(#(position, revision))
+    Ok(position)
   })
 }
 
-fn decode_outbox_ids(
-  rows: array.Array(Dynamic),
-) -> Result(List(Int), Error(domain_error, decode_error)) {
-  rows
-  |> array.to_list
-  |> list.try_map(fn(row) {
-    decode.run(row, decode.field("id", decode.int))
-    |> result.map_error(RowDecodeError)
-  })
+fn append_row_decoder() -> decode.Decoder(#(Int, Int)) {
+  use position <- decode.field("position", decode.int)
+  use revision <- decode.field("revision", decode.int)
+  decode.success(#(position, revision))
 }
 
 fn decode_int_field(
@@ -697,25 +776,6 @@ fn append_select_sql(
     "select ?, ?, (select coalesce(max(revision), -1) from factos_events where stream = ?) + cast(? as integer), ?, cast(? as integer), ?, ?, ? where "
       <> condition,
     list.append(base_values, condition_values),
-  )
-}
-
-fn outbox_insert_sql(
-  outbox_rows: List(OutboxRow),
-) -> #(String, List(String)) {
-  let placeholders =
-    list.repeat("(?, ?, ?)", list.length(outbox_rows))
-    |> string.join(with: ", ")
-  let values =
-    outbox_rows
-    |> list.flat_map(fn(OutboxRow(event_type, stream, payload)) {
-      [stream, event_type, payload]
-    })
-  #(
-    "insert into event_outbox (stream, event_type, payload) values "
-    <> placeholders
-    <> " returning id",
-    values,
   )
 }
 
@@ -880,5 +940,38 @@ fn metadata_from_text(metadata: String) -> factos.Metadata {
         }
       })
       |> factos.metadata
+  }
+}
+
+pub fn error_to_string(
+  error: Error(domain_error, decode_error),
+  domain_error_to_string: fn(domain_error) -> String,
+  decode_error_to_string: fn(domain_error) -> String,
+) -> String {
+  case error {
+    DecodeError(_) -> todo
+    DomainError(error) -> domain_error_to_string(error)
+    StoreError(error) -> "store error: " <> error
+    RowDecodeError(decode_error) ->
+      "database row decode error: "
+      <> list.map(decode_error, decode_error_to_string) |> string.join(", ")
+    AppendConditionFailed(factos.NoAppendCondition) ->
+      "append to event failed: No append condition"
+    AppendConditionFailed(factos.FailIfEventsMatch(query: _, after: _)) ->
+      "append to event failed: Events matched"
+  }
+}
+
+fn decode_error_to_string(decode_error: decode.DecodeError) -> String {
+  case decode_error {
+    decode.DecodeError(expected:, found:, path:) ->
+      "expected: "
+      <> expected
+      <> ", found: "
+      <> found
+      <> ", "
+      <> "path: ["
+      <> path |> string.join(",")
+      <> "]"
   }
 }

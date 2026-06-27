@@ -366,8 +366,7 @@ pub fn decide_context(
   command: command,
   decider: Decider(command, state, event, domain_error),
 ) -> Result(#(Context(event, state), List(event)), domain_error) {
-  let Decider(_, decide, _) = decider
-  use events <- result.try(decide(context.state, command))
+  use events <- result.try(decider.decide(context.state, command))
   Ok(#(context, events))
 }
 
