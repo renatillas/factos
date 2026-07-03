@@ -272,7 +272,7 @@ fn evolve(state: State, event: Event) -> State {
 }
 
 fn ticket_codec() -> factos_pog.EventCodec(Event, DecodeError) {
-  factos_pog.EventCodec(encode: encode_event, decode: decode_event)
+  factos_pog.codec(encode: encode_event, decode: decode_event, side_effects: [])
 }
 
 fn encode_event(event: Event) -> factos_pog.Proposed(Event) {

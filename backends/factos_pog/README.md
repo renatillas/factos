@@ -6,15 +6,28 @@ This backend follows the "Simply Event Sourcing" shape used by Factos: accepted 
 
 ## Design Notes
 
-The table stores opaque event bytes plus store-visible query metadata: event type and tags. This is a DCB-style tradeoff. PostgreSQL does not need to understand payloads, but any payload value needed by future context queries must be exposed as a tag when the event is written.
+The event table stores opaque event bytes plus store-visible query metadata:
+event type and tags. Tags are also mirrored into `factos_event_tags` so
+context reads and context-stability checks can use indexed SQL predicates
+instead of decoding unrelated rows in the application. PostgreSQL does not
+need to understand payloads, but any payload value needed by future context
+queries must be exposed as a tag when the event is written.
 
-`dispatch_context` runs inside a PostgreSQL transaction and locks the event table before reading, deciding, checking, and appending. This is intentionally conservative. It makes arbitrary `FailIfEventsMatch(query, after)` checks correct without trying to infer lock keys from dynamic query metadata. A higher-throughput backend could replace the table lock with advisory locks or more granular query-specific locks, but only if it preserves the same context-stability guarantee.
+`dispatch_context` runs inside a PostgreSQL transaction and locks the event
+table before reading, deciding, checking, and appending. This is intentionally
+conservative. It makes arbitrary `FailIfEventsMatch(query, after)` checks
+correct without trying to infer lock keys from dynamic query metadata. A
+higher-throughput backend could replace the table lock with advisory locks or
+more granular query-specific locks, but only if it preserves the same
+context-stability guarantee.
 
 `dispatch_stream` is also available for applications where one stream revision really is the intended consistency boundary. It is an implementation strategy, not the definition of Event Sourcing.
 
+`factos/factos_pog/outbox` provides the PostgreSQL counterpart to the Cloudflare outbox helpers. `migrate` creates the `event_outbox` table so codec side effects can persist retryable work after a successful append.
+
 ## Usage
 
-Start a `pog` pool in your application supervision tree, run `migrate`, then call `dispatch_context` or `dispatch_stream` with your domain decider and codec.
+Start a `pog` pool in your application supervision tree, run `migrate`, build a codec with `factos_pog.codec`, then call `dispatch_with_query`/`dispatch_context` or `dispatch`/`dispatch_stream` with your domain decider and command.
 
 ```gleam
 let connection = pog.named_connection(pool_name)

@@ -26,6 +26,7 @@ packages = [
 factos = { path = "../.." }
 gleam_erlang = { version = ">= 1.0.0 and < 2.0.0" }
 gleam_stdlib = { version = ">= 1.0.0 and < 2.0.0" }
+gleam_time = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 global_value = { version = ">= 1.0.0 and < 2.0.0" }
 pog = { version = ">= 4.1.0 and < 5.0.0" }

@@ -16,6 +16,7 @@
 
 import factos
 import gleam/dynamic/decode
+import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
@@ -56,15 +57,18 @@ pub type StoredEvent {
   )
 }
 
-pub type EventCodec(event, decode_error) {
+pub type EventCodec(event) {
   /// Application-owned PostgreSQL event codec.
   ///
   /// `encode` converts a domain event into bytes and metadata. `decode` converts a
   /// stored row back into a `factos.Decoded` domain event. Decode failures are kept
   /// in the application's own error type and wrapped as `DecodeError`.
+  /// `side_effects` run after a successful append and receive the exact domain
+  /// events that were just persisted.
   EventCodec(
     encode: fn(event) -> Proposed(event),
-    decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
+    decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
+    side_effects: List(fn(List(event)) -> Nil),
   )
 }
 
@@ -77,27 +81,53 @@ pub type Append {
   Append(current_revision: Int, position: factos.SequencePosition)
 }
 
-pub type Error(domain_error, decode_error) {
+pub type Error(domain_error) {
   /// The decider rejected the command with a domain error.
   DomainError(domain_error)
-
-  /// The application codec could not decode a stored event.
-  DecodeError(decode_error)
 
   /// PostgreSQL or `pog` returned an error while running a query.
   StoreError(pog.QueryError)
 
   /// A stream revision or context append condition failed.
   AppendConditionFailed(factos.AppendCondition)
+  DecodeError(DecodeError)
 }
 
-/// Create or update the PostgreSQL schema required by this backend.
+pub type DecodeError {
+  UnknownEvent
+  InvalidData
+}
+
+type QuerySql {
+  QuerySql(sql: String, parameters: List(QueryParameter))
+}
+
+type QueryParameter {
+  IntParameter(Int)
+  TextParameter(String)
+}
+
+/// Create a new codec.
 ///
+/// `encode` turns a domain event into a `Proposed` event ready for persistence.
+/// `decode` turns a stored row back into a domain event. Decode failures are
+/// returned as `DecodeError` and stop load/read flows rather than panicking.
+/// `side_effects` run after a successful append. They are outside the database
+/// transaction; use an outbox table if the effect must be retried.
+pub fn codec(
+  encode encode: fn(event) -> Proposed(event),
+  decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
+  side_effects side_effects: List(fn(List(event)) -> Nil),
+) -> EventCodec(event) {
+  EventCodec(encode:, decode:, side_effects:)
+}
+
 /// The schema is an append-only `factos_events` table with a global identity
 /// `position`, per-stream `revision`, event `type`, newline-encoded `tags`, and
-/// opaque `data` bytes. The `(stream, revision)` uniqueness constraint supports
-/// stream-revision consistency. Position indexes support context reads and checks.
-pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_, _)) {
+/// opaque `data` bytes. Queryable tags are also mirrored into
+/// `factos_event_tags`, which gives event-type/tag context reads indexed SQL
+/// plans instead of loading the whole event table into the application.
+pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
   // `pog` uses prepared statements, and PostgreSQL does not allow multiple SQL
   // commands in one prepared statement. Keep migrations split into individual
   // statements rather than relying on client-side SQL script execution.
@@ -132,13 +162,70 @@ pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_, _)) {
       on factos_events(position)
     ",
   ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create table if not exists factos_event_tags (
+      position bigint not null references factos_events(position) on delete cascade,
+      tag text not null,
+      primary key(position, tag)
+    )
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create index if not exists factos_events_type_position
+      on factos_events(type, position)
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create index if not exists factos_event_tags_tag_position
+      on factos_event_tags(tag, position)
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    insert into factos_event_tags(position, tag)
+    select factos_events.position, split_tags.tag
+    from factos_events
+    cross join lateral regexp_split_to_table(factos_events.tags, E'\\n') as split_tags(tag)
+    where split_tags.tag <> ''
+    on conflict do nothing
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create table if not exists event_outbox (
+      id bigint generated always as identity primary key,
+      stream text not null,
+      event_type text not null,
+      payload text not null,
+      status text not null default 'pending',
+      error text,
+      created_at bigint not null default extract(epoch from now())::bigint,
+      processed_at bigint
+    )
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create index if not exists event_outbox_status_id
+      on event_outbox(status, id)
+    ",
+  ))
   Ok(Nil)
 }
 
 fn execute_migration(
   connection: pog.Connection,
   sql: String,
-) -> Result(Nil, Error(_, _)) {
+) -> Result(Nil, Error(_)) {
   pog.query(sql)
   |> pog.execute(on: connection)
   |> result.map(fn(_) { Nil })
@@ -155,8 +242,8 @@ pub fn read_context(
   connection: pog.Connection,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-) -> Result(factos.Context(event, state), Error(domain_error, decode_error)) {
+  codec codec: EventCodec(event),
+) -> Result(factos.Context(event, state), Error(domain_error)) {
   let factos.Decider(initial, _, evolve) = decider
 
   use events <- result.try(read_matching_events(connection, query, codec))
@@ -186,14 +273,14 @@ pub fn read_context(
 /// other even if their contexts do not overlap. It is deliberately simple and
 /// correct. A future backend can use advisory locks or query-specific lock keys,
 /// but only if it keeps the same context-stability guarantee.
-pub fn dispatch_context(
+pub fn dispatch_with_query(
   connection: pog.Connection,
   stream stream_name: String,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
+  codec codec: EventCodec(event),
   command command: command,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Append, Error(domain_error)) {
   use transaction_connection <- run_locked_transaction(connection)
   use context <- result.try(read_context(
     transaction_connection,
@@ -207,13 +294,15 @@ pub fn dispatch_context(
   )
   let #(context, events) = pair
 
-  append_with_condition(
+  use append <- result.try(append_with_condition(
     transaction_connection,
     stream_name,
     events,
     codec,
     context.append_condition,
-  )
+  ))
+  run_side_effects(codec, events)
+  Ok(append)
 }
 
 /// Load and fold one stream.
@@ -225,11 +314,8 @@ pub fn load_stream(
   connection: pog.Connection,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
-) -> Result(
-  factos.LoadedStream(event, state),
-  Error(domain_error, decode_error),
-) {
+  codec codec: EventCodec(event),
+) -> Result(factos.LoadedStream(event, state), Error(domain_error)) {
   let factos.Decider(initial, _, evolve) = decider
   use events <- result.try(read_stream_events(connection, stream_name, codec))
 
@@ -250,13 +336,13 @@ pub fn load_stream(
 /// Use this when one stream is intentionally the consistency boundary. It remains
 /// useful, but it is not required by Event Sourcing. For command-specific rules,
 /// prefer `dispatch_context` so the protected boundary follows the decision.
-pub fn dispatch_stream(
+pub fn dispatch(
   connection: pog.Connection,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, decode_error),
+  codec codec: EventCodec(event),
   command command: command,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Append, Error(domain_error)) {
   use transaction_connection <- run_locked_transaction(connection)
   use loaded <- result.try(load_stream(
     transaction_connection,
@@ -270,19 +356,27 @@ pub fn dispatch_stream(
     |> result.map_error(DomainError),
   )
 
-  append_stream_events(
+  use append <- result.try(append_stream_events(
     transaction_connection,
     stream_name,
     events,
     codec,
     loaded.revision,
-  )
+  ))
+  run_side_effects(codec, events)
+  Ok(append)
+}
+
+fn run_side_effects(codec: EventCodec(event), events: List(event)) -> Nil {
+  let EventCodec(_, _, side_effects) = codec
+  use side_effect <- list.each(side_effects)
+  side_effect(events)
 }
 
 fn run_locked_transaction(
   connection: pog.Connection,
-  work: fn(pog.Connection) -> Result(Append, Error(domain_error, decode_error)),
-) -> Result(Append, Error(domain_error, decode_error)) {
+  work: fn(pog.Connection) -> Result(Append, Error(domain_error)),
+) -> Result(Append, Error(domain_error)) {
   case
     {
       use transaction_connection <- pog.transaction(connection)
@@ -305,9 +399,9 @@ fn append_with_condition(
   connection: pog.Connection,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, decode_error),
+  codec: EventCodec(event),
   condition: factos.AppendCondition,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Append, Error(domain_error)) {
   case condition {
     factos.NoAppendCondition ->
       append_current_stream(connection, stream_name, events, codec)
@@ -325,8 +419,8 @@ fn append_current_stream(
   connection: pog.Connection,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, decode_error),
-) -> Result(Append, Error(domain_error, decode_error)) {
+  codec: EventCodec(event),
+) -> Result(Append, Error(domain_error)) {
   use revision <- result.try(
     current_revision(connection, stream_name)
     |> result.map_error(StoreError),
@@ -344,9 +438,9 @@ fn append_stream_events(
   connection: pog.Connection,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, decode_error),
+  codec: EventCodec(event),
   expected: factos.Revision,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Append, Error(domain_error)) {
   case events {
     [] ->
       Ok(Append(
@@ -378,14 +472,14 @@ fn insert_events(
   connection: pog.Connection,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, decode_error),
+  codec: EventCodec(event),
   revision: Int,
   position: factos.SequencePosition,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Append, Error(domain_error)) {
   case events {
     [] -> Ok(Append(current_revision: revision - 1, position: position))
     [event, ..rest] -> {
-      let EventCodec(encode, _) = codec
+      let EventCodec(encode, _, _) = codec
       let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
       use returned <- result.try(
         pog.query(
@@ -411,6 +505,7 @@ fn insert_events(
         [position, ..] -> factos.SequencePosition(position)
         [] -> position
       }
+      use _ <- result.try(insert_event_tags(connection, position, tags))
       insert_events(
         connection,
         stream_name,
@@ -426,26 +521,32 @@ fn insert_events(
 fn read_matching_events(
   connection: pog.Connection,
   query: factos.Query,
-  codec: EventCodec(event, decode_error),
-) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
+  codec: EventCodec(event),
+) -> Result(List(factos.Recorded(event)), Error(domain_error)) {
+  let QuerySql(where_sql, parameters) = query_to_sql(query, 1)
   use rows <- result.try(
     pog.query(
-      "select position, id, stream, revision, type, version, tags, metadata, data from factos_events order by position",
+      "select position, id, stream, revision, type, version, tags, metadata, data
+       from factos_events
+       "
+      <> where_sql
+      <> "
+       order by position",
     )
+    |> with_parameters(parameters)
     |> pog.returning(stored_event_decoder())
     |> pog.execute(on: connection)
     |> result.map(fn(returned) { returned.rows })
     |> result.map_error(StoreError),
   )
   decode_rows(rows, codec)
-  |> result.map(list.filter(_, factos.matches_query(_, query)))
 }
 
 fn read_stream_events(
   connection: pog.Connection,
   stream_name: String,
-  codec: EventCodec(event, decode_error),
-) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
+  codec: EventCodec(event),
+) -> Result(List(factos.Recorded(event)), Error(domain_error)) {
   use rows <- result.try(
     pog.query(
       "select position, id, stream, revision, type, version, tags, metadata, data from factos_events where stream = $1 order by revision",
@@ -461,8 +562,8 @@ fn read_stream_events(
 
 fn decode_rows(
   rows: List(StoredEvent),
-  codec: EventCodec(event, decode_error),
-) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
+  codec: EventCodec(event),
+) -> Result(List(factos.Recorded(event)), Error(domain_error)) {
   case rows {
     [] -> Ok([])
     [row, ..rest] -> {
@@ -475,9 +576,9 @@ fn decode_rows(
 
 fn decode_row(
   row: StoredEvent,
-  codec: EventCodec(event, decode_error),
-) -> Result(factos.Recorded(event), Error(domain_error, decode_error)) {
-  let EventCodec(_, decode_event) = codec
+  codec: EventCodec(event),
+) -> Result(factos.Recorded(event), Error(domain_error)) {
+  let EventCodec(_, decode_event, _) = codec
   use decoded <- result.try(decode_event(row) |> result.map_error(DecodeError))
   let factos.Decoded(event, type_, version, tags, metadata) = decoded
   let StoredEvent(position, id, stream, revision, _, _, _, _, _) = row
@@ -542,53 +643,25 @@ fn has_matching_events_after(
   query: factos.Query,
   after: factos.SequencePosition,
 ) -> Result(Bool, pog.QueryError) {
-  let after_position = case after {
-    factos.NoPosition -> -1
-    factos.SequencePosition(position) -> position
-  }
-  pog.query("select type, tags from factos_events where position > $1")
-  |> pog.parameter(pog.int(after_position))
-  |> pog.returning(query_match_decoder())
+  let QuerySql(where_sql, parameters) = matching_events_after_sql(query, after)
+  pog.query("select 1
+     from factos_events
+     " <> where_sql <> "
+     limit 1")
+  |> with_parameters(parameters)
+  |> pog.returning(int_field_decoder())
   |> pog.execute(on: connection)
   |> result.map(fn(returned) {
-    use pair <- list.any(returned.rows)
-    let #(type_, tags) = pair
-    matches_query_parts(type_, tags, query)
+    case returned.rows {
+      [] -> False
+      [_, ..] -> True
+    }
   })
-}
-
-fn query_match_decoder() -> decode.Decoder(
-  #(factos.EventType, List(factos.Tag)),
-) {
-  use type_name <- decode.field(0, decode.string)
-  use tags <- decode.field(1, decode.string)
-  decode.success(#(factos.event_type(type_name), tags_from_text(tags)))
 }
 
 fn int_field_decoder() -> decode.Decoder(Int) {
   use value <- decode.field(0, decode.int)
   decode.success(value)
-}
-
-fn matches_query_parts(
-  type_: factos.EventType,
-  tags: List(factos.Tag),
-  query: factos.Query,
-) -> Bool {
-  factos.matches_query(
-    factos.Recorded(
-      id: "",
-      stream: "",
-      revision: 0,
-      position: factos.NoPosition,
-      type_: type_,
-      version: 1,
-      tags: tags,
-      metadata: factos.empty_metadata(),
-      event: Nil,
-    ),
-    query,
-  )
 }
 
 fn stream_revision(events: List(factos.Recorded(event))) -> factos.Revision {
@@ -621,16 +694,213 @@ fn revision_to_int(revision: factos.Revision) -> Int {
   }
 }
 
+fn insert_event_tags(
+  connection: pog.Connection,
+  position: factos.SequencePosition,
+  tags: List(factos.Tag),
+) -> Result(Nil, Error(domain_error)) {
+  case position, tags {
+    factos.NoPosition, _ -> Ok(Nil)
+    _, [] -> Ok(Nil)
+    factos.SequencePosition(position), [_, ..] -> {
+      use _ <- result.try(
+        pog.query(
+          "
+          insert into factos_event_tags(position, tag)
+          select $1, unnest($2::text[])
+          on conflict do nothing
+          ",
+        )
+        |> pog.parameter(pog.int(position))
+        |> pog.parameter(pog.array(
+          fn(tag) { pog.text(factos.tag_value(tag)) },
+          tags,
+        ))
+        |> pog.execute(on: connection)
+        |> result.map_error(StoreError),
+      )
+      Ok(Nil)
+    }
+  }
+}
+
+fn query_to_sql(query: factos.Query, parameter_index: Int) -> QuerySql {
+  case query {
+    factos.AllEvents -> QuerySql(sql: "", parameters: [])
+    factos.Query(items) -> {
+      case items {
+        [] -> QuerySql(sql: "where 1 = 0", parameters: [])
+        [_, ..] -> {
+          let #(sql, parameters, _) =
+            build_query_items_sql(items, parameter_index, [], [])
+          QuerySql(
+            sql: "where " <> string.join(list.reverse(sql), with: " or "),
+            parameters: list.reverse(parameters),
+          )
+        }
+      }
+    }
+  }
+}
+
+fn matching_events_after_sql(
+  query: factos.Query,
+  after: factos.SequencePosition,
+) -> QuerySql {
+  let after_position = case after {
+    factos.NoPosition -> -1
+    factos.SequencePosition(position) -> position
+  }
+
+  case query {
+    factos.AllEvents ->
+      QuerySql(sql: "where position > $1", parameters: [
+        IntParameter(after_position),
+      ])
+    factos.Query(items) -> {
+      case items {
+        [] -> QuerySql(sql: "where 1 = 0", parameters: [])
+        [_, ..] -> {
+          let #(sql, parameters, _) =
+            build_query_items_sql(items, 2, [], [IntParameter(after_position)])
+          QuerySql(
+            sql: "where position > $1 and ("
+              <> string.join(list.reverse(sql), with: " or ")
+              <> ")",
+            parameters: list.reverse(parameters),
+          )
+        }
+      }
+    }
+  }
+}
+
+fn build_query_items_sql(
+  items: List(factos.QueryItem),
+  parameter_index: Int,
+  sql: List(String),
+  parameters: List(QueryParameter),
+) -> #(List(String), List(QueryParameter), Int) {
+  case items {
+    [] -> #(sql, parameters, parameter_index)
+    [item, ..rest] -> {
+      let QuerySql(item_sql, item_parameters) =
+        query_item_to_sql(item, parameter_index)
+      build_query_items_sql(
+        rest,
+        parameter_index + list.length(item_parameters),
+        [item_sql, ..sql],
+        list.append(list.reverse(item_parameters), parameters),
+      )
+    }
+  }
+}
+
+fn query_item_to_sql(item: factos.QueryItem, parameter_index: Int) -> QuerySql {
+  let factos.QueryItem(types, tags) = item
+  let QuerySql(type_sql, type_parameters) = types_to_sql(types, parameter_index)
+  let QuerySql(tag_sql, tag_parameters) =
+    tags_to_sql(tags, parameter_index + list.length(type_parameters))
+
+  QuerySql(
+    sql: "(" <> type_sql <> " and " <> tag_sql <> ")",
+    parameters: list.append(type_parameters, tag_parameters),
+  )
+}
+
+fn types_to_sql(
+  types: List(factos.EventType),
+  parameter_index: Int,
+) -> QuerySql {
+  case types {
+    [] -> QuerySql(sql: "1 = 1", parameters: [])
+    [_, ..] ->
+      QuerySql(
+        sql: "type in ("
+          <> placeholders(parameter_index, list.length(types))
+          <> ")",
+        parameters: list.map(types, fn(type_) {
+          TextParameter(factos.event_type_name(type_))
+        }),
+      )
+  }
+}
+
+fn tags_to_sql(tags: List(factos.Tag), parameter_index: Int) -> QuerySql {
+  case tags {
+    [] -> QuerySql(sql: "1 = 1", parameters: [])
+    [_, ..] -> {
+      let clauses =
+        tags
+        |> list.index_map(fn(_tag, index) { "exists (
+            select 1 from factos_event_tags
+            where factos_event_tags.position = factos_events.position
+              and factos_event_tags.tag = $" <> int.to_string(
+            parameter_index + index,
+          ) <> "
+          )" })
+      QuerySql(
+        sql: "(" <> string.join(clauses, with: " and ") <> ")",
+        parameters: list.map(tags, fn(tag) {
+          TextParameter(factos.tag_value(tag))
+        }),
+      )
+    }
+  }
+}
+
+fn placeholders(start: Int, count: Int) -> String {
+  placeholder_indices(start, count, [])
+  |> list.map(int.to_string)
+  |> list.map(fn(index) { "$" <> index })
+  |> string.join(with: ", ")
+}
+
+fn placeholder_indices(
+  start: Int,
+  remaining: Int,
+  acc: List(Int),
+) -> List(Int) {
+  case remaining <= 0 {
+    True -> list.reverse(acc)
+    False -> placeholder_indices(start + 1, remaining - 1, [start, ..acc])
+  }
+}
+
+fn with_parameters(
+  query: pog.Query(row),
+  parameters: List(QueryParameter),
+) -> pog.Query(row) {
+  case parameters {
+    [] -> query
+    [parameter, ..rest] -> {
+      let query = case parameter {
+        IntParameter(value) -> pog.parameter(query, pog.int(value))
+        TextParameter(value) -> pog.parameter(query, pog.text(value))
+      }
+      with_parameters(query, rest)
+    }
+  }
+}
+
 fn tags_to_text(tags: List(factos.Tag)) -> String {
-  tags
-  |> list.map(factos.tag_value)
-  |> string.join(with: "\n")
+  case tags {
+    [] -> ""
+    [_, ..] ->
+      "\n"
+      <> { tags |> list.map(factos.tag_value) |> string.join(with: "\n") }
+      <> "\n"
+  }
 }
 
 fn tags_from_text(tags: String) -> List(factos.Tag) {
   case string.is_empty(tags) {
     True -> []
-    False -> tags |> string.split(on: "\n") |> list.map(factos.tag)
+    False ->
+      tags
+      |> string.split(on: "\n")
+      |> list.filter(fn(tag) { !string.is_empty(tag) })
+      |> list.map(factos.tag)
   }
 }
 
@@ -654,5 +924,41 @@ fn metadata_from_text(metadata: String) -> factos.Metadata {
         }
       })
       |> factos.metadata
+  }
+}
+
+pub fn error_to_string(
+  error: Error(domain_error),
+  domain_error_to_string: fn(domain_error) -> String,
+) -> String {
+  case error {
+    DomainError(error) -> domain_error_to_string(error)
+    StoreError(error) -> "store error: " <> query_error_to_string(error)
+    AppendConditionFailed(factos.NoAppendCondition) ->
+      "append to event failed: No append condition"
+    AppendConditionFailed(factos.FailIfEventsMatch(query: _, after: _)) ->
+      "append to event failed: Events matched"
+    DecodeError(UnknownEvent) -> "unknown event decoded"
+    DecodeError(InvalidData) -> "invalid data stored in database"
+  }
+}
+
+fn query_error_to_string(error: pog.QueryError) -> String {
+  case error {
+    pog.ConstraintViolated(message:, constraint:, detail:) ->
+      "constraint violated: " <> constraint <> ": " <> message <> " " <> detail
+    pog.PostgresqlError(code:, name:, message:) ->
+      "postgresql error " <> code <> " " <> name <> ": " <> message
+    pog.UnexpectedArgumentCount(expected:, got:) ->
+      "unexpected argument count: expected "
+      <> int.to_string(expected)
+      <> ", got "
+      <> int.to_string(got)
+    pog.UnexpectedArgumentType(expected:, got:) ->
+      "unexpected argument type: expected " <> expected <> ", got " <> got
+    pog.UnexpectedResultType(errors) ->
+      "unexpected result type: " <> int.to_string(list.length(errors))
+    pog.QueryTimeout -> "query timeout"
+    pog.ConnectionUnavailable -> "connection unavailable"
   }
 }

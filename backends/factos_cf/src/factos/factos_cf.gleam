@@ -23,6 +23,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/javascript/array
 import gleam/javascript/promise.{type Promise}
+import gleam/json
 import gleam/list
 import gleam/pair
 import gleam/result
@@ -89,10 +90,10 @@ pub fn new(database: d1.Database) -> Client {
 
 /// Application-owned codec and side-effect configuration for this D1 backend.
 ///
-pub opaque type EventCodec(event, state, decode_error) {
+pub opaque type EventCodec(event, state) {
   EventCodec(
     encode: fn(event) -> Proposed(event),
-    decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
+    decode: fn(StoredEvent) -> Result(factos.Decoded(event), EventDecodeError),
     side_effects: List(fn(List(event)) -> Promise(Nil)),
   )
 }
@@ -118,9 +119,10 @@ pub opaque type EventCodec(event, state, decode_error) {
 /// queue or scheduled worker.
 pub fn codec(
   encode encode: fn(event) -> Proposed(event),
-  decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), decode_error),
+  decode decode: fn(StoredEvent) ->
+    Result(factos.Decoded(event), EventDecodeError),
   side_effects side_effects: List(fn(List(event)) -> Promise(Nil)),
-) -> EventCodec(event, state, decode_error) {
+) -> EventCodec(event, state) {
   EventCodec(encode:, decode:, side_effects:)
 }
 
@@ -135,12 +137,11 @@ pub type Append {
   Append(current_revision: Int, position: factos.SequencePosition)
 }
 
-pub type Error(domain_error, decode_error) {
+pub type Error(domain_error) {
   /// The decider rejected the command with a domain error.
   DomainError(domain_error)
 
-  /// The application codec could not decode a stored event.
-  DecodeError(decode_error)
+  EventDecodeError(EventDecodeError)
 
   /// D1 returned an error while running a query.
   StoreError(String)
@@ -150,6 +151,12 @@ pub type Error(domain_error, decode_error) {
 
   /// A stream revision or context append condition failed.
   AppendConditionFailed(factos.AppendCondition)
+}
+
+pub type EventDecodeError {
+  UnknownEventType(String)
+  /// The application codec could not decode a stored event.
+  InvalidPayload(json.DecodeError)
 }
 
 type AppendMode {
@@ -175,7 +182,7 @@ type QuerySql {
 /// insert outbox rows immediately after successful appends. Keeping both tables
 /// in one migration function prevents consumers from accidentally deploying the
 /// event store without the side-effect infrastructure.
-pub fn migrate(client: Client) -> Promise(Result(Nil, Error(_, _))) {
+pub fn migrate(client: Client) -> Promise(Result(Nil, Error(_))) {
   let Client(database:) = client
   use _ <- promise.try_await(execute_migration(
     database,
@@ -228,7 +235,7 @@ pub fn migrate(client: Client) -> Promise(Result(Nil, Error(_, _))) {
 fn execute_migration(
   database: d1.Database,
   sql: String,
-) -> Promise(Result(Nil, Error(_, _))) {
+) -> Promise(Result(Nil, Error(domain_error))) {
   d1.prepare(database, sql)
   |> d1.run
   |> promise.map(fn(result) {
@@ -251,10 +258,8 @@ pub fn read_context(
   client: Client,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, state, decode_error),
-) -> Promise(
-  Result(factos.Context(event, state), Error(domain_error, decode_error)),
-) {
+  codec codec: EventCodec(event, state),
+) -> Promise(Result(factos.Context(event, state), Error(domain_error))) {
   use events <- promise.map_try(read_matching_events(
     client.database,
     query,
@@ -292,9 +297,9 @@ pub fn dispatch_with_query(
   stream stream_name: String,
   query query: factos.Query,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, state, decode_error),
+  codec codec: EventCodec(event, state),
   command command: command,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   use context <- promise.try_await(read_context(
     client,
     query:,
@@ -330,10 +335,8 @@ pub fn load_stream(
   client: Client,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, state, decode_error),
-) -> Promise(
-  Result(factos.LoadedStream(event, state), Error(domain_error, decode_error)),
-) {
+  codec codec: EventCodec(event, state),
+) -> Promise(Result(factos.LoadedStream(event, state), Error(domain_error))) {
   use events <- promise.map_try(read_stream_events(
     client.database,
     stream_name,
@@ -363,9 +366,9 @@ pub fn dispatch(
   client: Client,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
-  codec codec: EventCodec(event, state, decode_error),
+  codec codec: EventCodec(event, state),
   command command: command,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   let Client(database:) = client
   use loaded <- promise.try_await(load_stream(
     client,
@@ -396,7 +399,7 @@ pub fn dispatch(
 }
 
 fn run_side_effects(
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   events: List(event),
 ) -> promise.Promise(List(Nil)) {
   promise.await_list(list.map(codec.side_effects, fn(f) { f(events) }))
@@ -406,9 +409,9 @@ fn append_with_condition(
   database: d1.Database,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   condition: factos.AppendCondition,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   case condition {
     factos.NoAppendCondition ->
       append_events(database, stream_name, events, codec, CurrentStream)
@@ -427,9 +430,9 @@ fn append_stream_events(
   database: d1.Database,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   expected: factos.Revision,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   append_events(database, stream_name, events, codec, ExpectedStream(expected))
 }
 
@@ -437,9 +440,9 @@ fn append_events(
   database: d1.Database,
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   mode: AppendMode,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   case events {
     [] ->
       current_revision(database, stream_name)
@@ -463,7 +466,7 @@ fn decode_batch_result(
   batch_result: Promise(Result(array.Array(d1.RunResult), String)),
   events: List(event),
   mode: AppendMode,
-) -> Promise(Result(Append, Error(domain_error, decode_error))) {
+) -> Promise(Result(Append, Error(domain_error))) {
   use result <- promise.map(batch_result)
   use run_results <- result.try(result |> result.map_error(StoreError))
   let run_result_list = array.to_list(run_results)
@@ -492,10 +495,8 @@ fn decode_batch_result(
 fn read_matching_events(
   database: d1.Database,
   query: factos.Query,
-  codec: EventCodec(event, state, decode_error),
-) -> Promise(
-  Result(List(factos.Recorded(event)), Error(domain_error, decode_error)),
-) {
+  codec: EventCodec(event, state),
+) -> Promise(Result(List(factos.Recorded(event)), Error(domain_error))) {
   let #(where_sql, params) = query_to_sql(query)
 
   d1.prepare(
@@ -590,10 +591,8 @@ fn tags_to_sql(tags: List(factos.Tag)) {
 fn read_stream_events(
   database: d1.Database,
   stream_name: String,
-  codec: EventCodec(event, state, decode_error),
-) -> Promise(
-  Result(List(factos.Recorded(event)), Error(domain_error, decode_error)),
-) {
+  codec: EventCodec(event, state),
+) -> Promise(Result(List(factos.Recorded(event)), Error(domain_error))) {
   d1.prepare(
     database,
     "select position, id, stream, revision, type, version, tags, metadata, data from factos_events where stream = ? order by revision",
@@ -609,7 +608,7 @@ fn read_stream_events(
 fn current_revision(
   database: d1.Database,
   stream_name: String,
-) -> Promise(Result(Int, Error(domain_error, decode_error))) {
+) -> Promise(Result(Int, Error(domain_error))) {
   d1.prepare(
     database,
     "select coalesce(max(revision), -1) from factos_events where stream = ?",
@@ -627,8 +626,8 @@ fn current_revision(
 
 fn decode_rows(
   rows: array.Array(array.Array(Dynamic)),
-  codec: EventCodec(event, state, decode_error),
-) -> Result(List(factos.Recorded(event)), Error(domain_error, decode_error)) {
+  codec: EventCodec(event, state),
+) -> Result(List(factos.Recorded(event)), Error(domain_error)) {
   rows
   |> array.to_list
   |> list.try_map(fn(row) { decode_row(row, codec) })
@@ -636,12 +635,12 @@ fn decode_rows(
 
 fn decode_row(
   row: array.Array(Dynamic),
-  codec: EventCodec(event, state, decode_error),
-) -> Result(factos.Recorded(event), Error(domain_error, decode_error)) {
+  codec: EventCodec(event, state),
+) -> Result(factos.Recorded(event), Error(domain_error)) {
   use stored <- result.try(decode_stored_event(row))
   let EventCodec(_, decode_event, _) = codec
   use decoded <- result.try(
-    decode_event(stored) |> result.map_error(DecodeError),
+    decode_event(stored) |> result.map_error(EventDecodeError),
   )
   let factos.Decoded(event, type_, version, tags, metadata) = decoded
   let StoredEvent(position, id, stream, revision, _, _, _, _, _) = stored
@@ -661,7 +660,7 @@ fn decode_row(
 
 fn decode_stored_event(
   row: array.Array(Dynamic),
-) -> Result(StoredEvent, Error(domain_error, decode_error)) {
+) -> Result(StoredEvent, Error(domain_error)) {
   use position <- result.try(decode_int_field(row, 0))
   use id <- result.try(decode_string_field(row, 1))
   use stream <- result.try(decode_string_field(row, 2))
@@ -687,7 +686,7 @@ fn decode_stored_event(
 
 fn decode_append_rows(
   rows: array.Array(Dynamic),
-) -> Result(List(#(Int, Int)), Error(domain_error, decode_error)) {
+) -> Result(List(#(Int, Int)), Error(domain_error)) {
   rows
   |> array.to_list
   |> list.try_map(fn(row) {
@@ -708,7 +707,7 @@ fn append_row_decoder() -> decode.Decoder(#(Int, Int)) {
 fn decode_int_field(
   row: array.Array(Dynamic),
   index: Int,
-) -> Result(Int, Error(domain_error, decode_error)) {
+) -> Result(Int, Error(domain_error)) {
   use value <- result.try(
     array.get(row, index)
     |> result.replace_error(RowDecodeError([])),
@@ -720,7 +719,7 @@ fn decode_int_field(
 fn decode_string_field(
   row: array.Array(Dynamic),
   index: Int,
-) -> Result(String, Error(domain_error, decode_error)) {
+) -> Result(String, Error(domain_error)) {
   use value <- result.try(
     array.get(row, index)
     |> result.replace_error(RowDecodeError([])),
@@ -732,7 +731,7 @@ fn decode_string_field(
 fn append_sql(
   stream_name: String,
   events: List(event),
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   mode: AppendMode,
 ) -> #(String, List(String)) {
   let rows =
@@ -753,7 +752,7 @@ fn append_sql(
 fn append_select_sql(
   stream_name: String,
   event: event,
-  codec: EventCodec(event, state, decode_error),
+  codec: EventCodec(event, state),
   mode: AppendMode,
   index: Int,
 ) -> #(String, List(String)) {
@@ -944,12 +943,10 @@ fn metadata_from_text(metadata: String) -> factos.Metadata {
 }
 
 pub fn error_to_string(
-  error: Error(domain_error, decode_error),
+  error: Error(domain_error),
   domain_error_to_string: fn(domain_error) -> String,
-  decode_error_to_string: fn(domain_error) -> String,
 ) -> String {
   case error {
-    DecodeError(_) -> todo
     DomainError(error) -> domain_error_to_string(error)
     StoreError(error) -> "store error: " <> error
     RowDecodeError(decode_error) ->
@@ -959,6 +956,16 @@ pub fn error_to_string(
       "append to event failed: No append condition"
     AppendConditionFailed(factos.FailIfEventsMatch(query: _, after: _)) ->
       "append to event failed: Events matched"
+    EventDecodeError(UnknownEventType(type_)) -> "unknown event type: " <> type_
+    EventDecodeError(InvalidPayload(json.UnexpectedEndOfInput)) ->
+      "invalid json: unexpected end of input"
+    EventDecodeError(InvalidPayload(json.UnexpectedByte(string))) ->
+      "invalid json: unexpected byte" <> string
+    EventDecodeError(InvalidPayload(json.UnexpectedSequence(string))) ->
+      "invalid json: unexpected sequence" <> string
+    EventDecodeError(InvalidPayload(json.UnableToDecode(decode_errors))) ->
+      "invalid json: "
+      <> list.map(decode_errors, decode_error_to_string) |> string.join(",")
   }
 }
 

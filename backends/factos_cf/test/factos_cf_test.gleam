@@ -33,10 +33,6 @@ type DomainError {
   AlreadyReserved(name: String)
 }
 
-type DecodeError {
-  UnknownEvent(String)
-}
-
 type TestDatabase {
   TestDatabase(miniflare: miniflare.Miniflare, database: d1.Database)
 }
@@ -387,10 +383,10 @@ fn decode_count(row: Dynamic) -> Int {
   }
 }
 
-fn error_to_string(error: factos_cf.Error(DomainError, DecodeError)) -> String {
+fn error_to_string(error: factos_cf.Error(DomainError)) -> String {
   case error {
     factos_cf.DomainError(_) -> "domain error"
-    factos_cf.DecodeError(_) -> "decode error"
+    factos_cf.EventDecodeError(_) -> "decode error"
     factos_cf.StoreError(error) -> error
     factos_cf.RowDecodeError(_) -> "row decode error"
     factos_cf.AppendConditionFailed(_) -> "append condition failed"
@@ -440,13 +436,13 @@ fn evolve(state: List(String), event: Event) -> List(String) {
   }
 }
 
-fn codec() -> factos_cf.EventCodec(Event, List(String), DecodeError) {
+fn codec() -> factos_cf.EventCodec(Event, List(String)) {
   factos_cf.codec(encode:, decode:, side_effects: [])
 }
 
 fn codec_with_side_effect(
   database: d1.Database,
-) -> factos_cf.EventCodec(Event, List(String), DecodeError) {
+) -> factos_cf.EventCodec(Event, List(String)) {
   factos_cf.codec(encode: encode, decode: decode, side_effects: [
     fn(_) { insert_side_effect_marker(database) },
   ])
@@ -469,7 +465,7 @@ fn encode(event: Event) -> factos_cf.Proposed(Event) {
 
 fn decode(
   stored: factos_cf.StoredEvent,
-) -> Result(factos.Decoded(Event), DecodeError) {
+) -> Result(factos.Decoded(Event), factos_cf.EventDecodeError) {
   case factos.event_type_name(stored.type_) {
     "reserved" ->
       Ok(factos.Decoded(
@@ -479,6 +475,6 @@ fn decode(
         tags: stored.tags,
         metadata: stored.metadata,
       ))
-    other -> Error(UnknownEvent(other))
+    other -> Error(factos_cf.UnknownEventType(other))
   }
 }
