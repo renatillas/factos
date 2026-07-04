@@ -35,12 +35,18 @@ and applications decide how reactors/effect delivery should run.
 
 ## Schema
 
-Run migrations once before dispatching commands:
+The backend ships its schema as `priv/migrations.sql`. Run that SQL once before
+dispatching commands. In an Erlang-target application, locate the file through
+the package `priv` directory:
 
 ```gleam
-let connection = pog.named_connection(pool_name)
-let assert Ok(Nil) = factos_pog.migrate(connection)
+import gleam/erlang/application
+
+let assert Ok(priv_directory) = application.priv_directory("factos_pog")
+let migration_path = priv_directory <> "/migrations.sql"
 ```
+
+`factos_pog.migrate` still exists for v1 compatibility, but it is deprecated.
 
 The backend creates two tables.
 

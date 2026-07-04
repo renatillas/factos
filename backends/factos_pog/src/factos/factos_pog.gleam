@@ -125,11 +125,15 @@ pub fn codec(
   EventCodec(encode:, decode:)
 }
 
+/// Deprecated: read `priv/migrations.sql` from the `factos_pog` application
+/// with `gleam/erlang/application.priv_directory` and run it with your
+/// application's migration tool instead.
 /// The schema is an append-only `factos_events` table with a global identity
 /// `position`, per-stream `revision`, event `type`, newline-encoded `tags`, and
 /// opaque `data` bytes. Queryable tags are also mirrored into
 /// `factos_event_tags`, which gives event-type/tag context reads indexed SQL
 /// plans instead of loading the whole event table into the application.
+@deprecated("Use the SQL file at factos_pog/priv/migrations.sql instead.")
 pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
   // `pog` uses prepared statements, and PostgreSQL does not allow multiple SQL
   // commands in one prepared statement. Keep migrations split into individual
@@ -414,10 +418,11 @@ fn append_stream_events(
 ) -> Result(Dispatch(event), Error(domain_error)) {
   case events {
     [] -> {
-      let append = Append(
-        current_revision: revision_to_int(expected),
-        position: factos.NoPosition,
-      )
+      let append =
+        Append(
+          current_revision: revision_to_int(expected),
+          position: factos.NoPosition,
+        )
       Ok(Dispatch(append:, events: []))
     }
     [_, ..] -> {
@@ -483,17 +488,18 @@ fn insert_events(
         [position, ..] -> factos.SequencePosition(position)
         [] -> position
       }
-      let recorded = factos.Recorded(
-        id: id,
-        stream: stream_name,
-        revision: revision,
-        position: position,
-        type_: type_,
-        version: version,
-        tags: tags,
-        metadata: metadata,
-        event: event,
-      )
+      let recorded =
+        factos.Recorded(
+          id: id,
+          stream: stream_name,
+          revision: revision,
+          position: position,
+          type_: type_,
+          version: version,
+          tags: tags,
+          metadata: metadata,
+          event: event,
+        )
       use _ <- result.try(insert_event_tags(connection, position, tags))
       insert_events(
         connection,

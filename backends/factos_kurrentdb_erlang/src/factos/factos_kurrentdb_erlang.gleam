@@ -58,7 +58,10 @@ pub type Dispatch(event) {
   ///
   /// `append` is the KurrentDB append response. `events` are the committed events
   /// observed after the append, suitable for pure Factos reactors.
-  Dispatch(append: append_to_stream.Append, events: List(factos.Recorded(event)))
+  Dispatch(
+    append: append_to_stream.Append,
+    events: List(factos.Recorded(event)),
+  )
 }
 
 pub type Error(domain_error, decode_error) {

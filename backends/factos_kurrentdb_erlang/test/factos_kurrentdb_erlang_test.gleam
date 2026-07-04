@@ -60,9 +60,10 @@ pub fn dispatch_stream_handles_many_events_integration_test() {
     type_: factos.event_type(event_type),
   )
   let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    Incremented(100),
-  ]
+  assert factos.react_all(reactor: reactor, events: dispatch.events)
+    == [
+      Incremented(100),
+    ]
 
   let assert Ok(loaded) =
     factos_kurrentdb_erlang.load_stream(
@@ -100,9 +101,10 @@ pub fn read_context_handles_many_streams_integration_test() {
     type_: factos.event_type(event_type),
   )
   let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    Incremented(1),
-  ]
+  assert factos.react_all(reactor: reactor, events: dispatch.events)
+    == [
+      Incremented(1),
+    ]
 
   let assert Ok(context) =
     factos_kurrentdb_erlang.read_context(

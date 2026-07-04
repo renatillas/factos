@@ -1,14 +1,20 @@
 import factos
 import factos/factos_pog
 import gleam/bit_array
+import gleam/erlang/application
 import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{Some}
+import gleam/otp/actor
 import gleam/result
+import gleam/string
 import gleeunit
-import global_value
 import pog
+import simplifile
+import testcontainer
+import testcontainer/error as testcontainer_error
+import testcontainer_formulas/postgres
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -43,164 +49,194 @@ type CounterState {
   CounterState(total: Int)
 }
 
-type TestGlobalData {
-  TestGlobalData(connection: pog.Connection)
+pub type Timeout(a) {
+  Timeout(time: Int, function: fn() -> a)
 }
 
+pub fn dispatch_alias_persists_events_test_() -> Timeout(Nil) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
 
-pub fn dispatch_alias_persists_events_test() {
-  let TestGlobalData(connection) = global_data()
-  reset_schema(connection)
+      let assert Ok(dispatch) =
+        factos_pog.dispatch(
+          connection,
+          stream: "user-renata",
+          decider: decider(),
+          codec: codec(),
+          command: RegisterUser("renata"),
+        )
 
-  let assert Ok(dispatch) =
-    factos_pog.dispatch(
-      connection,
-      stream: "user-renata",
-      decider: decider(),
-      codec: codec(),
-      command: RegisterUser("renata"),
-    )
+      let assert factos_pog.Append(
+        current_revision: 0,
+        position: factos.SequencePosition(_),
+      ) = dispatch.append
+      let assert [recorded] = dispatch.events
+      assert_user_recorded(
+        recorded,
+        stream: "user-renata",
+        revision: 0,
+        position: dispatch.append.position,
+        username: "renata",
+      )
+      let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+      assert factos.react_all(reactor: reactor, events: dispatch.events)
+        == [
+          UserRegistered("renata"),
+        ]
 
-  let assert factos_pog.Append(
-    current_revision: 0,
-    position: factos.SequencePosition(_),
-  ) = dispatch.append
-  let assert [recorded] = dispatch.events
-  assert_user_recorded(
-    recorded,
-    stream: "user-renata",
-    revision: 0,
-    position: dispatch.append.position,
-    username: "renata",
+      let assert Ok(loaded) =
+        factos_pog.load_stream(
+          connection,
+          stream: "user-renata",
+          decider: decider(),
+          codec: codec(),
+        )
+
+      assert loaded.state == Taken
+      assert loaded.revision == factos.CurrentRevision(0)
+      Nil
+    })
+  Nil
+}
+
+pub fn dispatch_with_query_filters_before_decoding_unknown_events_test_() -> Timeout(
+  Nil,
+) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+      insert_unknown_event(connection)
+
+      let query = username_query("renata")
+
+      let assert Ok(dispatch) =
+        factos_pog.dispatch_with_query(
+          connection,
+          stream: "user-renata",
+          query: query,
+          decider: decider(),
+          codec: codec(),
+          command: RegisterUser("renata"),
+        )
+
+      let assert factos_pog.Append(
+        current_revision: 0,
+        position: factos.SequencePosition(_),
+      ) = dispatch.append
+      let assert [recorded] = dispatch.events
+      assert_user_recorded(
+        recorded,
+        stream: "user-renata",
+        revision: 0,
+        position: dispatch.append.position,
+        username: "renata",
+      )
+      let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+      assert factos.react_all(reactor: reactor, events: dispatch.events)
+        == [
+          UserRegistered("renata"),
+        ]
+
+      let assert Ok(context) =
+        factos_pog.read_context(
+          connection,
+          query: query,
+          decider: decider(),
+          codec: codec(),
+        )
+
+      let assert [event] = context.events
+      assert event.event == UserRegistered("renata")
+      assert context.state == Taken
+      assert context.position != factos.NoPosition
+      Nil
+    })
+  Nil
+}
+
+pub fn dispatch_with_query_handles_many_streams_test_() -> Timeout(Nil) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+
+      let query =
+        factos.query([
+          factos.query_item(types: [factos.event_type("Incremented")], tags: [
+            factos.tag("counter:load"),
+          ]),
+        ])
+
+      let assert Ok(dispatch) =
+        dispatch_counter_context_many(connection, query, 25)
+      let assert factos_pog.Append(
+        current_revision: 0,
+        position: factos.SequencePosition(_),
+      ) = dispatch.append
+      let assert [recorded] = dispatch.events
+      assert_counter_recorded(
+        recorded,
+        stream: "counter-context-1",
+        revision: 0,
+        position: dispatch.append.position,
+        value: 25,
+        type_: factos.event_type("Incremented"),
+      )
+      let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+      assert factos.react_all(reactor: reactor, events: dispatch.events)
+        == [
+          Incremented(25),
+        ]
+
+      let assert Ok(context) =
+        factos_pog.read_context(
+          connection,
+          query: query,
+          decider: counter_decider(),
+          codec: counter_codec(),
+        )
+
+      assert context.state == CounterState(25)
+      assert list.length(context.events) == 25
+      Nil
+    })
+  Nil
+}
+
+fn with_test_connection(
+  body: fn(pog.Connection) -> Nil,
+) -> Result(Nil, testcontainer_error.Error) {
+  use postgres_container <- testcontainer.with_formula(
+    postgres.new() |> postgres.formula(),
   )
-  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    UserRegistered("renata"),
-  ]
-
-  let assert Ok(loaded) =
-    factos_pog.load_stream(
-      connection,
-      stream: "user-renata",
-      decider: decider(),
-      codec: codec(),
-    )
-
-  assert loaded.state == Taken
-  assert loaded.revision == factos.CurrentRevision(0)
+  let #(pool_pid, connection) = start_test_connection(postgres_container)
+  body(connection)
+  process.send_exit(pool_pid)
+  process.sleep(100)
+  Ok(Nil)
 }
 
-pub fn dispatch_with_query_filters_before_decoding_unknown_events_test() {
-  let TestGlobalData(connection) = global_data()
-  reset_schema(connection)
-  insert_unknown_event(connection)
-
-  let query = username_query("renata")
-
-  let assert Ok(dispatch) =
-    factos_pog.dispatch_with_query(
-      connection,
-      stream: "user-renata",
-      query: query,
-      decider: decider(),
-      codec: codec(),
-      command: RegisterUser("renata"),
-    )
-
-  let assert factos_pog.Append(
-    current_revision: 0,
-    position: factos.SequencePosition(_),
-  ) = dispatch.append
-  let assert [recorded] = dispatch.events
-  assert_user_recorded(
-    recorded,
-    stream: "user-renata",
-    revision: 0,
-    position: dispatch.append.position,
-    username: "renata",
-  )
-  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    UserRegistered("renata"),
-  ]
-
-  let assert Ok(context) =
-    factos_pog.read_context(
-      connection,
-      query: query,
-      decider: decider(),
-      codec: codec(),
-    )
-
-  let assert [event] = context.events
-  assert event.event == UserRegistered("renata")
-  assert context.state == Taken
-  assert context.position != factos.NoPosition
-}
-
-pub fn dispatch_with_query_handles_many_streams_test() {
-  let TestGlobalData(connection) = global_data()
-  reset_schema(connection)
-
-  let query =
-    factos.query([
-      factos.query_item(types: [factos.event_type("Incremented")], tags: [
-        factos.tag("counter:load"),
-      ]),
-    ])
-
-  let assert Ok(dispatch) = dispatch_counter_context_many(connection, query, 25)
-  let assert factos_pog.Append(
-    current_revision: 0,
-    position: factos.SequencePosition(_),
-  ) = dispatch.append
-  let assert [recorded] = dispatch.events
-  assert_counter_recorded(
-    recorded,
-    stream: "counter-context-1",
-    revision: 0,
-    position: dispatch.append.position,
-    value: 25,
-    type_: factos.event_type("Incremented"),
-  )
-  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    Incremented(25),
-  ]
-
-  let assert Ok(context) =
-    factos_pog.read_context(
-      connection,
-      query: query,
-      decider: counter_decider(),
-      codec: counter_codec(),
-    )
-
-  assert context.state == CounterState(25)
-  assert list.length(context.events) == 25
-}
-
-
-fn global_data() -> TestGlobalData {
-  global_value.create_with_unique_name("factos_pog_test.global.data", fn() {
-    TestGlobalData(connection: start_test_connection())
-  })
-}
-
-fn start_test_connection() -> pog.Connection {
+fn start_test_connection(
+  postgres_container: postgres.PostgresContainer,
+) -> #(process.Pid, pog.Connection) {
+  let postgres.PostgresContainer(host:, port:, database:, username:, ..) =
+    postgres_container
   let pool_name = process.new_name("factos_pog_test")
   let config =
     pog.default_config(pool_name)
-    |> pog.host("127.0.0.1")
-    |> pog.port(55432)
-    |> pog.database("factos_pog")
-    |> pog.user("postgres")
+    |> pog.host(host)
+    |> pog.port(port)
+    |> pog.database(database)
+    |> pog.user(username)
     |> pog.password(Some("postgres"))
     |> pog.ssl(pog.SslDisabled)
 
-  let assert Ok(_) = pog.start(config)
+  let assert Ok(actor.Started(pid:, ..)) = pog.start(config)
   process.sleep(100)
-  pog.named_connection(pool_name)
+  #(pid, pog.named_connection(pool_name))
 }
 
 fn reset_schema(connection: pog.Connection) -> Nil {
@@ -210,8 +246,24 @@ fn reset_schema(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query("drop table if exists factos_events")
     |> pog.execute(on: connection)
-  let assert Ok(Nil) = factos_pog.migrate(connection)
-  Nil
+  execute_migration_file(connection)
+}
+
+fn execute_migration_file(connection: pog.Connection) -> Nil {
+  let assert Ok(priv_directory) = application.priv_directory("factos_pog")
+  let assert Ok(sql) = simplifile.read(priv_directory <> "/migrations.sql")
+
+  sql
+  |> string.split(";")
+  |> list.each(fn(statement) {
+    case string.trim(statement) {
+      "" -> Nil
+      statement -> {
+        let assert Ok(_) = pog.query(statement) |> pog.execute(on: connection)
+        Nil
+      }
+    }
+  })
 }
 
 fn insert_unknown_event(connection: pog.Connection) -> Nil {
@@ -386,10 +438,7 @@ fn counter_evolve(state: CounterState, event: CounterEvent) -> CounterState {
 }
 
 fn counter_codec() -> factos_pog.EventCodec(CounterEvent) {
-  factos_pog.codec(
-    encode: encode_counter_event,
-    decode: decode_counter_event,
-  )
+  factos_pog.codec(encode: encode_counter_event, decode: decode_counter_event)
 }
 
 fn encode_counter_event(

@@ -347,7 +347,6 @@ pub fn dispatch(
   }
 }
 
-
 fn append_with_condition(
   database: d1.Database,
   stream_name: String,
@@ -392,10 +391,8 @@ fn append_events(
       |> promise.map(fn(result) {
         result
         |> result.map(fn(revision) {
-          let append = Append(
-            current_revision: revision,
-            position: factos.NoPosition,
-          )
+          let append =
+            Append(current_revision: revision, position: factos.NoPosition)
           Dispatch(append:, events: [])
         })
       })
@@ -433,10 +430,11 @@ fn decode_batch_result(
   case list.length(appended) == list.length(events) {
     True -> {
       let #(position, revision) = last_append_row(appended)
-      let append = Append(
-        current_revision: revision,
-        position: factos.SequencePosition(position),
-      )
+      let append =
+        Append(
+          current_revision: revision,
+          position: factos.SequencePosition(position),
+        )
       Ok(Dispatch(
         append: append,
         events: recorded_append_rows(stream_name, events, appended),

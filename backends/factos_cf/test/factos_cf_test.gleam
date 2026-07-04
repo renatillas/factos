@@ -194,7 +194,6 @@ pub fn dispatch_context_rejects_changed_context_test() -> Promise(Nil) {
   promise.resolve(Nil)
 }
 
-
 fn new_test_database() -> Promise(TestDatabase) {
   let worker =
     miniflare.worker(
@@ -220,13 +219,11 @@ fn dispose(test_database: TestDatabase) -> Promise(Nil) {
   miniflare.dispose(test_database.miniflare)
 }
 
-
 fn clear_events(database: d1.Database) -> Promise(Result(Nil, String)) {
   d1.prepare(database, "delete from factos_events")
   |> d1.run
   |> promise.map(fn(run_result) { run_result |> result.map(fn(_) { Nil }) })
 }
-
 
 fn error_to_string(error: factos_cf.Error(DomainError)) -> String {
   case error {
@@ -237,7 +234,6 @@ fn error_to_string(error: factos_cf.Error(DomainError)) -> String {
     factos_cf.AppendConditionFailed(_) -> "append condition failed"
   }
 }
-
 
 fn reservation_decider() -> factos.Decider(
   Command,
@@ -270,7 +266,6 @@ fn evolve(state: List(String), event: Event) -> List(String) {
 fn codec() -> factos_cf.EventCodec(Event, List(String)) {
   factos_cf.codec(encode:, decode:)
 }
-
 
 fn encode(event: Event) -> factos_cf.Proposed(Event) {
   case event {

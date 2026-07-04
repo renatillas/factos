@@ -1,10 +1,12 @@
 import factos
 import factos/factos_sqlight
 import gleam/bit_array
+import gleam/erlang/application
 import gleam/int
 import gleam/list
 import gleam/result
 import gleeunit
+import simplifile
 import sqlight
 
 pub fn main() -> Nil {
@@ -47,7 +49,7 @@ type CounterState {
 
 pub fn dispatch_stream_persists_events_test() {
   use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+  execute_migration_file(connection)
 
   let assert Ok(dispatch) =
     factos_sqlight.dispatch_stream(
@@ -71,9 +73,10 @@ pub fn dispatch_stream_persists_events_test() {
     username: "renata",
   )
   let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    UserRegistered("renata"),
-  ]
+  assert factos.react_all(reactor: reactor, events: dispatch.events)
+    == [
+      UserRegistered("renata"),
+    ]
 
   let assert Ok(loaded) =
     factos_sqlight.load_stream(
@@ -89,7 +92,7 @@ pub fn dispatch_stream_persists_events_test() {
 
 pub fn dispatch_stream_handles_many_events_test() {
   use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+  execute_migration_file(connection)
 
   let assert Ok(dispatch) = dispatch_counter_stream_many(connection, 250)
   let assert factos_sqlight.Append(
@@ -105,9 +108,10 @@ pub fn dispatch_stream_handles_many_events_test() {
     value: 250,
   )
   let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    Incremented(250),
-  ]
+  assert factos.react_all(reactor: reactor, events: dispatch.events)
+    == [
+      Incremented(250),
+    ]
 
   let assert Ok(loaded) =
     factos_sqlight.load_stream(
@@ -124,7 +128,7 @@ pub fn dispatch_stream_handles_many_events_test() {
 
 pub fn dispatch_context_handles_many_streams_test() {
   use connection <- sqlight.with_connection(":memory:")
-  let assert Ok(Nil) = factos_sqlight.migrate(connection)
+  execute_migration_file(connection)
 
   let query =
     factos.query([
@@ -133,7 +137,8 @@ pub fn dispatch_context_handles_many_streams_test() {
       ]),
     ])
 
-  let assert Ok(dispatch) = dispatch_counter_context_many(connection, query, 100)
+  let assert Ok(dispatch) =
+    dispatch_counter_context_many(connection, query, 100)
   let assert factos_sqlight.Append(
     current_revision: 0,
     position: factos.SequencePosition(_),
@@ -147,9 +152,10 @@ pub fn dispatch_context_handles_many_streams_test() {
     value: 100,
   )
   let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
-  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
-    Incremented(100),
-  ]
+  assert factos.react_all(reactor: reactor, events: dispatch.events)
+    == [
+      Incremented(100),
+    ]
 
   let assert Ok(context) =
     factos_sqlight.read_context(
@@ -162,6 +168,13 @@ pub fn dispatch_context_handles_many_streams_test() {
   assert context.state == CounterState(100)
   assert list.length(context.events) == 100
   assert context.position != factos.NoPosition
+}
+
+fn execute_migration_file(connection: sqlight.Connection) -> Nil {
+  let assert Ok(priv_directory) = application.priv_directory("factos_sqlight")
+  let assert Ok(sql) = simplifile.read(priv_directory <> "/migrations.sql")
+  let assert Ok(Nil) = sqlight.exec(sql, on: connection)
+  Nil
 }
 
 fn decider() -> factos.Decider(Command, State, Event, DomainError) {
@@ -237,7 +250,10 @@ fn assert_user_recorded(
 fn dispatch_counter_stream_many(
   connection: sqlight.Connection,
   remaining: Int,
-) -> Result(factos_sqlight.Dispatch(CounterEvent), factos_sqlight.Error(Nil, DecodeError)) {
+) -> Result(
+  factos_sqlight.Dispatch(CounterEvent),
+  factos_sqlight.Error(Nil, DecodeError),
+) {
   case remaining {
     0 ->
       factos_sqlight.dispatch_stream(
@@ -269,7 +285,10 @@ fn dispatch_counter_context_many(
   connection: sqlight.Connection,
   query: factos.Query,
   remaining: Int,
-) -> Result(factos_sqlight.Dispatch(CounterEvent), factos_sqlight.Error(Nil, DecodeError)) {
+) -> Result(
+  factos_sqlight.Dispatch(CounterEvent),
+  factos_sqlight.Error(Nil, DecodeError),
+) {
   case remaining {
     0 ->
       factos_sqlight.dispatch_context(

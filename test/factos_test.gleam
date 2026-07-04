@@ -201,20 +201,27 @@ pub fn merge_views_projects_same_events_into_tuple_state_test() {
 
 pub fn react_maps_one_recorded_event_into_effect_values_test() -> Nil {
   let event =
-    recorded(UserRegistered("renata"), [factos.tag("username:renata")], revision: 5)
+    recorded(
+      UserRegistered("renata"),
+      [factos.tag("username:renata")],
+      revision: 5,
+    )
   let reactor =
     factos.reactor(react: fn(recorded) {
       case recorded.event {
         UserRegistered(username) -> [
-          recorded.id <> ":" <> int.to_string(recorded.revision) <> ":" <> username,
+          recorded.id
+          <> ":"
+          <> int.to_string(recorded.revision)
+          <> ":"
+          <> username,
         ]
         UsernameReserved(_) -> []
         DisplayNameChanged(_) -> []
       }
     })
 
-  assert factos.react(reactor: reactor, event: event)
-    == ["event-5:5:renata"]
+  assert factos.react(reactor: reactor, event: event) == ["event-5:5:renata"]
 }
 
 pub fn react_all_flattens_reactions_in_recorded_event_order_test() -> Nil {
@@ -247,7 +254,11 @@ pub fn react_all_flattens_reactions_in_recorded_event_order_test() -> Nil {
 
 pub fn merge_reactors_combines_outputs_for_the_same_recorded_event_test() -> Nil {
   let event =
-    recorded(UserRegistered("renata"), [factos.tag("username:renata")], revision: 7)
+    recorded(
+      UserRegistered("renata"),
+      [factos.tag("username:renata")],
+      revision: 7,
+    )
   let audit =
     factos.reactor(react: fn(recorded) {
       case recorded.event {

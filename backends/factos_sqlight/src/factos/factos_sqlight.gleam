@@ -104,12 +104,16 @@ pub type Error(domain_error, decode_error) {
   AppendConditionFailed(factos.AppendCondition)
 }
 
+/// Deprecated: read `priv/migrations.sql` from the `factos_sqlight` application
+/// with `gleam/erlang/application.priv_directory` and run it with your
+/// application's migration tool instead.
 /// Create or update the SQLite schema required by this backend.
 ///
 /// The schema is an append-only `factos_events` table with a global autoincrement
 /// `position`, per-stream `revision`, event `type`, newline-encoded `tags`, and
 /// opaque `data` bytes. It also creates indexes for stream/revision reads and
 /// position-based context checks.
+@deprecated("Use the SQL file at factos_sqlight/priv/migrations.sql instead.")
 pub fn migrate(connection: sqlight.Connection) -> Result(Nil, Error(_, _)) {
   sqlight.exec(
     "
@@ -348,10 +352,11 @@ fn append_stream_events(
 ) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   case events {
     [] -> {
-      let append = Append(
-        current_revision: revision_to_int(expected),
-        position: factos.NoPosition,
-      )
+      let append =
+        Append(
+          current_revision: revision_to_int(expected),
+          position: factos.NoPosition,
+        )
       Ok(Dispatch(append:, events: []))
     }
     [_, ..] -> {
@@ -419,17 +424,18 @@ fn insert_events(
         [position, ..] -> factos.SequencePosition(position)
         [] -> position
       }
-      let recorded = factos.Recorded(
-        id: id,
-        stream: stream_name,
-        revision: revision,
-        position: position,
-        type_: type_,
-        version: version,
-        tags: tags,
-        metadata: metadata,
-        event: event,
-      )
+      let recorded =
+        factos.Recorded(
+          id: id,
+          stream: stream_name,
+          revision: revision,
+          position: position,
+          type_: type_,
+          version: version,
+          tags: tags,
+          metadata: metadata,
+          event: event,
+        )
       insert_events(
         connection,
         stream_name,

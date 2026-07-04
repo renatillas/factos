@@ -20,18 +20,24 @@ delivery on top of the committed records returned by dispatch.
 [dependencies]
 factos = ">= 1.0.0 and < 2.0.0"
 factos_pog = ">= 1.0.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 ```
 
 ## Set up the schema
 
-Start a `pog` pool in your application supervision tree, get a named connection,
-and run the migration:
+The backend ships its schema as `priv/migrations.sql`. In an Erlang-target
+application, locate that file through the package `priv` directory and run it
+with your migration tool before dispatching commands:
 
 ```gleam
-let connection = pog.named_connection(pool_name)
-let assert Ok(Nil) = factos_pog.migrate(connection)
+import gleam/erlang/application
+
+let assert Ok(priv_directory) = application.priv_directory("factos_pog")
+let migration_path = priv_directory <> "/migrations.sql"
 ```
+
+`factos_pog.migrate` still exists for v1 compatibility, but it is deprecated.
 
 The migration creates:
 
