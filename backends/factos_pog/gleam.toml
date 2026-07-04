@@ -1,14 +1,24 @@
 name = "factos_pog"
 version = "1.0.0"
 description = "PostgreSQL backend for Factos context-first Event Sourcing using pog."
-licences = ["Apache-2.0"]
+licences = ["MIT"]
 links = [
   { title = "Factos", href = "https://factos.hexdocs.pm" },
   { title = "Simply Event Sourcing", href = "https://ricofritzsche.me/simply-event-sourcing/" },
 ]
+[repository]
+type = "github"
+user = "renatillas"
+repo = "factos"
+path = "backends/factos_pog"
+
+[[documentation.pages]]
+title = "How factos_pog Works"
+path = "how-it-works.html"
+source = "./docs/how-it-works.md"
 
 [dependencies]
-factos = { path = "../.." }
+factos = ">= 1.0.0 and < 2.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 gleam_time = ">= 1.0.0 and < 2.0.0"

@@ -1,89 +1,120 @@
-# Event Sourcing
+# Event Logs and Command Dispatch
 
-Factos follows the interpretation described in Rico Fritzsche's
-[Simply Event Sourcing](https://ricofritzsche.me/simply-event-sourcing/): Event
-Sourcing means accepted facts are stored as the source of truth, and the facts
-relevant to a decision are used before new facts are accepted.
+Factos stores events, and it also provides helpers for command dispatch.
 
-Aggregates, CQRS, projections, stream-per-object storage, message brokers, and
-microservices can be useful implementation choices, but they are not the
-definition of Event Sourcing.
+Those two ideas are related but not identical:
 
-## Events Are Accepted Facts
+- Event sourcing stores facts that happened: `TicketSold("renata")`.
+- Command handling receives orders: `BuyTicket("renata")`.
 
-An event is something the application has accepted as true. Current state is not
-the authority; it is derived by folding the event history.
+The backend stores the accepted events. The `Decider` and `dispatch` helpers are a
+standard way to process commands on top of that event log.
 
-```gleam
-pub type Event {
-  UsernameReserved(username: String)
-  UserRegistered(username: String)
-  DisplayNameChanged(user_id: String, name: String)
-}
+## What the backend persists
+
+A backend such as `factos_pog` persists event records:
+
+- event id;
+- stream;
+- stream revision;
+- global position;
+- event type;
+- event version;
+- tags;
+- metadata;
+- opaque payload bytes.
+
+It does not persist commands. It does not persist materialized views. It does not
+execute side effects.
+
+## What dispatch does
+
+A dispatch function combines an event log with a command handler:
+
+```text
+command + previous events -> new events or domain error
 ```
 
-In Gleam, each application defines its own event type. There is no need for a
-base event interface or runtime inheritance. The type tells readers and the
-compiler which facts exist in this part of the domain.
-
-## Decisions Use Relevant History
-
-To handle a command, load the relevant facts, fold them into a temporary state,
-and run a pure decision function.
+For `factos_pog.dispatch_with_query`, the previous events are selected by a
+`factos.Query`:
 
 ```gleam
-pub fn evolve(state: State, event: Event) -> State {
-  case state, event {
-    UsernameAvailable, UsernameReserved(_) -> UsernameTaken
-    UsernameAvailable, UserRegistered(_) -> UsernameTaken
-    UsernameAvailable, DisplayNameChanged(_, _) -> UsernameAvailable
-    UsernameTaken, UsernameReserved(_) -> UsernameTaken
-    UsernameTaken, UserRegistered(_) -> UsernameTaken
-    UsernameTaken, DisplayNameChanged(_, _) -> UsernameTaken
+factos.query([
+  factos.query_item(
+    types: [factos.event_type("TicketSold")],
+    tags: [factos.tag("event:gleamconf-2026")],
+  ),
+])
+```
+
+The backend reads those events, folds them into state, calls the decider, and
+appends the resulting events only if the query context is still stable.
+
+## What makes the append safe
+
+A context read observes a global event-log position. The backend then protects the
+append with:
+
+```gleam
+factos.FailIfEventsMatch(query, after: position)
+```
+
+That means:
+
+> do not append these new events if another event matching the same query was
+> accepted after the position used for the decision.
+
+This is how Factos lets the consistency boundary follow the rule. The boundary
+can be a tag, a set of event types, one stream, many streams, or all events.
+
+## What views are
+
+A `View` is not a durable projection table. It is a pure fold:
+
+```gleam
+factos.view(initial: 0, evolve: fn(count, event) {
+  case event {
+    TicketSold(_) -> count + 1
   }
-}
+})
 ```
 
-That folded state is only the state needed for the decision. Read models,
-reports, caches, and UI projections can be built separately with `View` values.
+You can run the fold over any list of events. To make a materialized view durable,
+your application stores the folded result.
 
-## Context-First Consistency
+Views can be recomputed as long as the stored event history can still be decoded.
+That makes event versioning and codec compatibility an application responsibility.
 
-Factos models command context consistency with `Query`, `Context`, and
-`AppendCondition`.
+## What reactors are
 
-For username registration, the context may be all events of selected types tagged
-with the requested username:
+A `Reactor` is also pure. It maps committed recorded events to effect values:
 
 ```gleam
-pub fn username_context(username: String) -> factos.Query {
-  factos.query([
-    factos.query_item(
-      types: [
-        factos.event_type("UsernameReserved"),
-        factos.event_type("UserRegistered"),
-      ],
-      tags: [factos.tag("username:" <> username)],
-    ),
-  ])
-}
+factos.react_all(ticket_reactor(), dispatch.events)
 ```
 
-After the decision is made, the backend should append the new facts only if no
-matching facts appeared after the position used for the decision. This protects
-the invariant without forcing every command into a single aggregate stream.
+Factos does not execute those effects. That is deliberate: replaying old events
+should not accidentally resend emails, charge cards, or publish webhooks.
 
-## Applying the Idea in Gleam
+## Where Factos is opinionated
 
-The typical Factos flow is:
+Factos is low-level about storage and high-level enough to standardize command
+dispatch.
 
-1. Model domain commands, events, states, and errors as Gleam custom types.
-2. Write an `evolve` function that folds accepted events into decision state.
-3. Write a `decide` function that returns `Result(List(Event), DomainError)`.
-4. Define the command context with event types and tags.
-5. Let a backend load matching facts and protect the append with the returned condition.
-6. React to the committed recorded facts with pure reactors if application effects are needed.
+It is opinionated that:
 
-This style keeps Event Sourcing concrete. The important parts are plain Gleam
-functions and types, while storage backends handle persistence, codecs, append
-guarantees, and the committed records that application code may react to.
+- facts are stored as an append-only event log;
+- command decisions should be pure;
+- context reads should produce append conditions;
+- backends should return committed records after append;
+- projections and effects should remain explicit application code.
+
+It is not opinionated about:
+
+- your event names;
+- your command names;
+- payload encoding;
+- projection storage;
+- subscription infrastructure;
+- effect retry policy;
+- deployment topology.

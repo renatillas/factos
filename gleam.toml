@@ -5,16 +5,30 @@ licences = ["MIT"]
 links = [
   { title = "Simply Event Sourcing", href = "https://ricofritzsche.me/simply-event-sourcing/" },
 ]
+[repository]
+type = "github"
+user = "renatillas"
+repo = "factos"
 
 [[documentation.pages]]
-title = "Domain-Driven Design"
-path = "domain-driven-design.html"
-source = "./docs/domain-driven-design.md"
+title = "Core Model"
+path = "core-model.html"
+source = "./docs/core-model.md"
 
 [[documentation.pages]]
-title = "Event Sourcing"
+title = "PostgreSQL Backend"
+path = "postgresql-backend.html"
+source = "./docs/postgresql-backend.md"
+
+[[documentation.pages]]
+title = "Event Logs and Command Dispatch"
 path = "event-sourcing.html"
 source = "./docs/event-sourcing.md"
+
+[[documentation.pages]]
+title = "Factos and Domain-Driven Design"
+path = "domain-driven-design.html"
+source = "./docs/domain-driven-design.md"
 
 # Fill out these fields if you intend to generate HTML documentation or publish
 # your project to the Hex package manager.
