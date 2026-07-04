@@ -104,6 +104,24 @@ pub fn empty_query_matches_all_events_test() {
   assert factos.matches_query(event, query)
 }
 
+pub fn metadata_helpers_get_put_and_remove_values_test() {
+  let metadata =
+    factos.metadata([
+      #("correlation_id", "old"),
+      #("actor", "user_123"),
+    ])
+    |> factos.metadata_put(factos.correlation_id, "new")
+
+  assert factos.metadata_get(metadata, factos.correlation_id) == Ok("new")
+  assert factos.metadata_get(metadata, factos.actor) == Ok("user_123")
+  assert factos.metadata_get(metadata, factos.operation_id) == Error(Nil)
+
+  let metadata = factos.metadata_remove(metadata, factos.correlation_id)
+
+  assert factos.metadata_get(metadata, factos.correlation_id) == Error(Nil)
+  assert factos.metadata_get(metadata, factos.actor) == Ok("user_123")
+}
+
 pub fn highest_position_keeps_later_position_test() {
   let early = factos.SequencePosition(10)
   let later = factos.SequencePosition(11)

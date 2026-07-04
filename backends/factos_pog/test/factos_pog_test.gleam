@@ -28,6 +28,10 @@ type Event {
   UserRegistered(username: String)
 }
 
+type Effect {
+  SendWelcome(username: String)
+}
+
 type State {
   Available
   Taken
@@ -206,6 +210,110 @@ pub fn dispatch_with_query_handles_many_streams_test_() -> Timeout(Nil) {
   Nil
 }
 
+pub fn read_events_after_returns_global_position_slice_test_() -> Timeout(Nil) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+
+      let query =
+        factos.query([
+          factos.query_item(types: [factos.event_type("UserRegistered")], tags: [
+            factos.tag("username:renata"),
+          ]),
+        ])
+      let assert Ok(first_dispatch) =
+        factos_pog.dispatch_with_query(
+          connection,
+          stream: "user-renata",
+          query: query,
+          decider: decider(),
+          codec: codec(),
+          command: RegisterUser("renata"),
+        )
+
+      let assert Ok(second_dispatch) =
+        factos_pog.dispatch_with_query(
+          connection,
+          stream: "user-lucy",
+          query: username_query("lucy"),
+          decider: decider(),
+          codec: codec(),
+          command: RegisterUser("lucy"),
+        )
+
+      let assert Ok(events) =
+        factos_pog.read_events_after(
+          connection,
+          query: factos.AllEvents,
+          after: first_dispatch.append.position,
+          limit: 10,
+          codec: codec(),
+        )
+
+      let assert [event] = events
+      assert event.event == UserRegistered("lucy")
+      assert event.position == second_dispatch.append.position
+      Nil
+    })
+  Nil
+}
+
+pub fn dispatch_with_reactor_persists_and_leases_outbox_test_() -> Timeout(Nil) {
+  use <- Timeout(120)
+  let assert Ok(Nil) =
+    with_test_connection(fn(connection) {
+      reset_schema(connection)
+
+      let assert Ok(dispatch) =
+        factos_pog.dispatch_with_reactor(
+          connection,
+          stream: "user-renata",
+          query: username_query("renata"),
+          decider: decider(),
+          event_codec: codec(),
+          command: RegisterUser("renata"),
+          reactor: welcome_reactor(),
+          effect_codec: effect_codec(),
+        )
+
+      let assert factos.SequencePosition(source_position) =
+        dispatch.append.position
+      let assert Ok(messages) =
+        factos_pog.lease_outbox(
+          connection,
+          consumer: "wallets",
+          target: "ledgers",
+          limit: 10,
+          lease_for_milliseconds: 30_000,
+        )
+
+      let assert [message] = messages
+      assert message.source_position == factos.SequencePosition(source_position)
+      assert message.source_context == "user-renata"
+      assert message.consumer == "wallets"
+      assert message.key == "welcome:renata"
+      assert message.target == "ledgers"
+      assert message.type_ == "SendWelcome"
+      assert factos.metadata_get(message.metadata, factos.correlation_id)
+        == Ok("corr-renata")
+      assert bit_array.to_string(message.payload) == Ok("renata")
+
+      let assert Ok(Nil) = factos_pog.ack_outbox(connection, id: message.id)
+      let assert Ok(messages_after_ack) =
+        factos_pog.lease_outbox(
+          connection,
+          consumer: "wallets",
+          target: "ledgers",
+          limit: 10,
+          lease_for_milliseconds: 30_000,
+        )
+      assert messages_after_ack == []
+      Nil
+    })
+  Nil
+}
+
 fn with_test_connection(
   body: fn(pog.Connection) -> Nil,
 ) -> Result(Nil, testcontainer_error.Error) {
@@ -240,6 +348,9 @@ fn start_test_connection(
 }
 
 fn reset_schema(connection: pog.Connection) -> Nil {
+  let assert Ok(_) =
+    pog.query("drop table if exists factos_outbox")
+    |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("drop table if exists factos_event_tags")
     |> pog.execute(on: connection)
@@ -368,6 +479,35 @@ fn decode(
       ))
     }
     _ -> Error(factos_pog.UnknownEvent)
+  }
+}
+
+fn welcome_reactor() -> factos.Reactor(Event, Effect) {
+  factos.reactor(react: fn(recorded) {
+    case recorded.event {
+      UserRegistered(username) -> [SendWelcome(username)]
+    }
+  })
+}
+
+fn effect_codec() -> factos_pog.EffectCodec(Effect) {
+  factos_pog.effect_codec(encode: encode_effect)
+}
+
+fn encode_effect(effect: Effect) -> factos_pog.ProposedEffect(Effect) {
+  case effect {
+    SendWelcome(username) ->
+      factos_pog.ProposedEffect(
+        effect: effect,
+        consumer: "wallets",
+        key: "welcome:" <> username,
+        target: "ledgers",
+        type_: "SendWelcome",
+        metadata: factos.metadata([
+          #(factos.correlation_id, "corr-" <> username),
+        ]),
+        payload: bit_array.from_string(username),
+      )
   }
 }
 

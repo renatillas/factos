@@ -87,6 +87,44 @@ pub type Dispatch(event) {
   Dispatch(append: Append, events: List(factos.Recorded(event)))
 }
 
+pub type ProposedEffect(effect) {
+  /// A durable integration effect prepared for outbox persistence.
+  ///
+  /// Applications own the effect payload and type names. Factos stores the
+  /// delivery envelope so workers can lease, retry, and acknowledge effects
+  /// without knowing the domain payload.
+  ProposedEffect(
+    effect: effect,
+    consumer: String,
+    key: String,
+    target: String,
+    type_: String,
+    metadata: factos.Metadata,
+    payload: BitArray,
+  )
+}
+
+pub type EffectCodec(effect) {
+  /// Application-owned outbox effect codec.
+  EffectCodec(encode: fn(effect) -> ProposedEffect(effect))
+}
+
+pub type OutboxMessage {
+  /// A leased outbox message ready for delivery by an application worker.
+  OutboxMessage(
+    id: Int,
+    source_position: factos.SequencePosition,
+    source_event_id: String,
+    source_context: String,
+    consumer: String,
+    key: String,
+    target: String,
+    type_: String,
+    metadata: factos.Metadata,
+    payload: BitArray,
+  )
+}
+
 pub type Error(domain_error) {
   /// The decider rejected the command with a domain error.
   DomainError(domain_error)
@@ -123,6 +161,13 @@ pub fn codec(
   decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
 ) -> EventCodec(event) {
   EventCodec(encode:, decode:)
+}
+
+/// Create an effect codec.
+pub fn effect_codec(
+  encode encode: fn(effect) -> ProposedEffect(effect),
+) -> EffectCodec(effect) {
+  EffectCodec(encode:)
 }
 
 /// Deprecated: read `priv/migrations.sql` from the `factos_pog` application
@@ -204,6 +249,38 @@ pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
     on conflict do nothing
     ",
   ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create table if not exists factos_outbox (
+      id bigint generated always as identity primary key,
+      source_position bigint not null references factos_events(position),
+      source_event_id text not null,
+      source_context text not null,
+      consumer text not null,
+      effect_key text not null,
+      target text not null,
+      type text not null,
+      metadata text not null,
+      payload bytea not null,
+      status text not null default 'pending',
+      attempts integer not null default 0,
+      available_at timestamptz not null default now(),
+      locked_until timestamptz,
+      last_error text,
+      created_at timestamptz not null default now(),
+      delivered_at timestamptz,
+      unique(consumer, effect_key)
+    )
+    ",
+  ))
+  use _ <- result.try(execute_migration(
+    connection,
+    "
+    create index if not exists factos_outbox_pending
+      on factos_outbox(status, available_at, id)
+    ",
+  ))
   Ok(Nil)
 }
 
@@ -247,6 +324,44 @@ pub fn read_context(
   ))
 }
 
+/// Read committed events after a global sequence position.
+///
+/// This is the bounded polling primitive used by durable subscriptions and
+/// process managers. Events are returned in global append order.
+pub fn read_events_after(
+  connection: pog.Connection,
+  query query: factos.Query,
+  after after: factos.SequencePosition,
+  limit limit: Int,
+  codec codec: EventCodec(event),
+) -> Result(List(factos.Recorded(event)), Error(domain_error)) {
+  case limit <= 0 {
+    True -> Ok([])
+    False -> {
+      let QuerySql(where_sql, parameters) =
+        matching_events_after_sql(query, after)
+      use rows <- result.try(
+        pog.query(
+          "select position, id, stream, revision, type, version, tags, metadata, data
+           from factos_events
+           "
+          <> where_sql
+          <> "
+           order by position
+           limit "
+          <> int.to_string(limit),
+        )
+        |> with_parameters(parameters)
+        |> pog.returning(stored_event_decoder())
+        |> pog.execute(on: connection)
+        |> result.map(fn(returned) { returned.rows })
+        |> result.map_error(StoreError),
+      )
+      decode_rows(rows, codec)
+    }
+  }
+}
+
 /// Run a full context-first read-decide-append command flow.
 ///
 /// PostgreSQL does not have a native primitive for "append if no row matching this
@@ -286,6 +401,50 @@ pub fn dispatch_with_query(
     codec,
     context.append_condition,
   )
+}
+
+/// Run a context-first command and durably persist reactor effects atomically.
+///
+/// Effects are inserted into `factos_outbox` in the same transaction as the
+/// domain events that produced them. If effect persistence fails, the event
+/// append rolls back too.
+pub fn dispatch_with_reactor(
+  connection: pog.Connection,
+  stream stream_name: String,
+  query query: factos.Query,
+  decider decider: factos.Decider(command, state, event, domain_error),
+  event_codec event_codec: EventCodec(event),
+  command command: command,
+  reactor reactor: factos.Reactor(event, effect),
+  effect_codec effect_codec: EffectCodec(effect),
+) -> Result(Dispatch(event), Error(domain_error)) {
+  use transaction_connection <- run_locked_transaction(connection)
+  use context <- result.try(read_context(
+    transaction_connection,
+    query: query,
+    decider: decider,
+    codec: event_codec,
+  ))
+  use pair <- result.try(
+    factos.decide_context(context, command, decider)
+    |> result.map_error(DomainError),
+  )
+  let #(context, events) = pair
+  use dispatch <- result.try(append_with_condition(
+    transaction_connection,
+    stream_name,
+    events,
+    event_codec,
+    context.append_condition,
+  ))
+  use _ <- result.try(insert_outbox_effects(
+    transaction_connection,
+    dispatch.events,
+    reactor,
+    effect_codec,
+  ))
+
+  Ok(dispatch)
 }
 
 /// Load and fold one stream.
@@ -512,6 +671,91 @@ fn insert_events(
       )
     }
   }
+}
+
+fn insert_outbox_effects(
+  connection: pog.Connection,
+  events: List(factos.Recorded(event)),
+  reactor: factos.Reactor(event, effect),
+  effect_codec: EffectCodec(effect),
+) -> Result(Nil, Error(domain_error)) {
+  case events {
+    [] -> Ok(Nil)
+    [event, ..rest] -> {
+      use _ <- result.try(insert_outbox_effects_for_event(
+        connection,
+        event,
+        factos.react(reactor, event),
+        effect_codec,
+      ))
+      insert_outbox_effects(connection, rest, reactor, effect_codec)
+    }
+  }
+}
+
+fn insert_outbox_effects_for_event(
+  connection: pog.Connection,
+  event: factos.Recorded(event),
+  effects: List(effect),
+  effect_codec: EffectCodec(effect),
+) -> Result(Nil, Error(domain_error)) {
+  case effects {
+    [] -> Ok(Nil)
+    [effect, ..rest] -> {
+      use _ <- result.try(insert_outbox_effect(
+        connection,
+        event,
+        effect,
+        effect_codec,
+      ))
+      insert_outbox_effects_for_event(connection, event, rest, effect_codec)
+    }
+  }
+}
+
+fn insert_outbox_effect(
+  connection: pog.Connection,
+  event: factos.Recorded(event),
+  effect: effect,
+  effect_codec: EffectCodec(effect),
+) -> Result(Nil, Error(domain_error)) {
+  let EffectCodec(encode) = effect_codec
+  let ProposedEffect(_, consumer, key, target, type_, metadata, payload) =
+    encode(effect)
+  let source_position = case event.position {
+    factos.NoPosition -> -1
+    factos.SequencePosition(position) -> position
+  }
+
+  pog.query(
+    "
+    insert into factos_outbox (
+      source_position,
+      source_event_id,
+      source_context,
+      consumer,
+      effect_key,
+      target,
+      type,
+      metadata,
+      payload
+    )
+    values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    on conflict (consumer, effect_key) do nothing
+    ",
+  )
+  |> pog.parameter(pog.int(source_position))
+  |> pog.parameter(pog.text(event.id))
+  |> pog.parameter(pog.text(event.stream))
+  |> pog.parameter(pog.text(consumer))
+  |> pog.parameter(pog.text(key))
+  |> pog.parameter(pog.text(target))
+  |> pog.parameter(pog.text(type_))
+  |> pog.parameter(pog.text(metadata_to_text(metadata)))
+  |> pog.parameter(pog.bytea(payload))
+  |> pog.execute(on: connection)
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(StoreError)
 }
 
 fn read_matching_events(
@@ -877,6 +1121,131 @@ fn with_parameters(
       with_parameters(query, rest)
     }
   }
+}
+
+/// Lease pending outbox messages for a consumer and target.
+///
+/// Leased messages stay in `pending` status but are hidden from competing
+/// workers until `locked_until` expires.
+pub fn lease_outbox(
+  connection: pog.Connection,
+  consumer consumer: String,
+  target target: String,
+  limit limit: Int,
+  lease_for_milliseconds lease_for_milliseconds: Int,
+) -> Result(List(OutboxMessage), Error(_)) {
+  case limit <= 0 {
+    True -> Ok([])
+    False ->
+      pog.query(
+        "
+        update factos_outbox
+        set
+          locked_until = now() + ($4::integer * interval '1 millisecond'),
+          attempts = attempts + 1
+        where id in (
+          select id
+          from factos_outbox
+          where consumer = $1
+            and target = $2
+            and status = 'pending'
+            and available_at <= now()
+            and (locked_until is null or locked_until <= now())
+          order by id
+          limit $3
+          for update skip locked
+        )
+        returning
+          id,
+          source_position,
+          source_event_id,
+          source_context,
+          consumer,
+          effect_key,
+          target,
+          type,
+          metadata,
+          payload
+        ",
+      )
+      |> pog.parameter(pog.text(consumer))
+      |> pog.parameter(pog.text(target))
+      |> pog.parameter(pog.int(limit))
+      |> pog.parameter(pog.int(lease_for_milliseconds))
+      |> pog.returning(outbox_message_decoder())
+      |> pog.execute(on: connection)
+      |> result.map(fn(returned) { returned.rows })
+      |> result.map_error(StoreError)
+  }
+}
+
+/// Mark an outbox message as delivered.
+pub fn ack_outbox(
+  connection: pog.Connection,
+  id id: Int,
+) -> Result(Nil, Error(_)) {
+  pog.query(
+    "
+    update factos_outbox
+    set status = 'delivered',
+        delivered_at = now(),
+        locked_until = null
+    where id = $1
+    ",
+  )
+  |> pog.parameter(pog.int(id))
+  |> pog.execute(on: connection)
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(StoreError)
+}
+
+/// Release an outbox message for retry after a delay.
+pub fn nack_outbox(
+  connection: pog.Connection,
+  id id: Int,
+  error error: String,
+  retry_after_milliseconds retry_after_milliseconds: Int,
+) -> Result(Nil, Error(_)) {
+  pog.query(
+    "
+    update factos_outbox
+    set locked_until = null,
+        last_error = $2,
+        available_at = now() + ($3::integer * interval '1 millisecond')
+    where id = $1
+    ",
+  )
+  |> pog.parameter(pog.int(id))
+  |> pog.parameter(pog.text(error))
+  |> pog.parameter(pog.int(retry_after_milliseconds))
+  |> pog.execute(on: connection)
+  |> result.map(fn(_) { Nil })
+  |> result.map_error(StoreError)
+}
+
+fn outbox_message_decoder() -> decode.Decoder(OutboxMessage) {
+  use id <- decode.field(0, decode.int)
+  use source_position <- decode.field(1, decode.int)
+  use source_event_id <- decode.field(2, decode.string)
+  use source_context <- decode.field(3, decode.string)
+  use consumer <- decode.field(4, decode.string)
+  use key <- decode.field(5, decode.string)
+  use target <- decode.field(6, decode.string)
+  use type_ <- decode.field(7, decode.string)
+  use metadata <- decode.field(8, decode.string)
+  use payload <- decode.field(9, decode.bit_array)
+  decode.success(OutboxMessage(
+    id: id,
+    source_position: factos.SequencePosition(source_position),
+    source_event_id: source_event_id,
+    source_context: source_context,
+    consumer: consumer,
+    key: key,
+    target: target,
+    type_: type_,
+    metadata: metadata_from_text(metadata),
+    payload: payload,
+  ))
 }
 
 fn tags_to_text(tags: List(factos.Tag)) -> String {

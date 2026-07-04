@@ -26,23 +26,32 @@ pog = ">= 4.1.0 and < 5.0.0"
 
 ## Set up the schema
 
-The backend ships its schema as `priv/migrations.sql`. In an Erlang-target
-application, locate that file through the package `priv` directory and run it
-with your migration tool before dispatching commands:
+The backend ships reusable dbmate-compatible migrations in `priv/dbmate/`.
+Application databases should vendor those files into their own migration
+repository, commit them, and run them with their normal migration tool before
+dispatching commands. The application migration repository owns ordering and
+execution history; `factos_pog` owns only the reusable schema artifacts.
+
+In an Erlang-target migration tool, locate the package `priv` directory and copy
+the package migrations into your application migration directory:
 
 ```gleam
 import gleam/erlang/application
 
 let assert Ok(priv_directory) = application.priv_directory("factos_pog")
-let migration_path = priv_directory <> "/migrations.sql"
+let migrations_directory = priv_directory <> "/dbmate"
 ```
 
-`factos_pog.migrate` still exists for v1 compatibility, but it is deprecated.
+`priv/migrations.sql` is retained for compatibility with already-published
+versions and for fresh bootstrap examples. Do not treat it as the append-only
+migration history for an application database. `factos_pog.migrate` still exists
+for v1 compatibility, but it is deprecated.
 
-The migration creates:
+The migrations create:
 
 - `factos_events`: append-only event rows;
-- `factos_event_tags`: indexed tag rows used for context reads.
+- `factos_event_tags`: indexed tag rows used for context reads;
+- `factos_outbox`: durable integration effects produced atomically with events.
 
 ## Define a codec
 

@@ -241,6 +241,57 @@ pub fn metadata_entries(metadata: Metadata) -> List(#(String, String)) {
   entries
 }
 
+/// Return the first metadata value stored for a key.
+pub fn metadata_get(metadata: Metadata, key: String) -> Result(String, Nil) {
+  let Metadata(entries) = metadata
+
+  entries
+  |> list.find(fn(entry) { entry.0 == key })
+  |> result.map(fn(entry) { entry.1 })
+}
+
+/// Store a metadata value, replacing any existing values for the same key.
+pub fn metadata_put(
+  metadata: Metadata,
+  key: String,
+  value: String,
+) -> Metadata {
+  let Metadata(entries) = metadata
+
+  Metadata([#(key, value), ..list.filter(entries, fn(entry) { entry.0 != key })])
+}
+
+/// Remove any metadata values stored for a key.
+pub fn metadata_remove(metadata: Metadata, key: String) -> Metadata {
+  let Metadata(entries) = metadata
+
+  Metadata(list.filter(entries, fn(entry) { entry.0 != key }))
+}
+
+/// Metadata key used to correlate all facts and effects for one operation.
+pub const correlation_id = "correlation_id"
+
+/// Metadata key used to identify the fact or effect that caused this one.
+pub const causation_id = "causation_id"
+
+/// Metadata key used to identify the bounded context that produced a fact.
+pub const source_context = "source_context"
+
+/// Metadata key used to identify the source event id for an integration effect.
+pub const source_event_id = "source_event_id"
+
+/// Metadata key used to identify the source event global position.
+pub const source_position = "source_position"
+
+/// Metadata key used to carry the actor responsible for a fact or effect.
+pub const actor = "actor"
+
+/// Metadata key used to carry the idempotency key for command deduplication.
+pub const idempotency_key = "idempotency_key"
+
+/// Metadata key used to carry the public operation id.
+pub const operation_id = "operation_id"
+
 /// Build a query from query items.
 ///
 /// An empty list becomes `AllEvents`; otherwise the query contains the supplied
