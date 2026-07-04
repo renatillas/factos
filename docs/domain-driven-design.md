@@ -305,11 +305,12 @@ For example:
 
 1. The domain accepts `PayInvoice` and produces `InvoicePaid`.
 2. Application code stores that fact.
-3. A handler reacts by sending a receipt email.
-4. Another handler updates a reporting view.
+3. A pure reactor inspects the committed recorded fact and returns effect values.
+4. Application or infrastructure code sends a receipt email and updates a reporting view.
 
 The receipt email is important, but sending it is not the same as deciding
-whether the invoice may be paid.
+whether the invoice may be paid. The reactor can describe the needed effect, but
+it should not hide IO inside the domain rule.
 
 ## Strategic and Tactical DDD
 
@@ -354,6 +355,7 @@ Factos is not required to practice DDD. It is one small set of primitives for
 applications that want to model domain decisions from accepted facts.
 
 With Factos, the application still owns the domain language. The application
-defines its commands, events, states, errors, and business rules. Factos provides
-supporting types for pure decisions and event-backed consistency, while storage
-and side effects remain outside the domain model.
+defines its commands, events, states, errors, business rules, and effect values.
+Factos provides supporting types for pure decisions, pure projections, pure
+reactors, and event-backed consistency, while storage and effect execution remain
+outside the domain model.

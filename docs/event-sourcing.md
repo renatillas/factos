@@ -82,7 +82,8 @@ The typical Factos flow is:
 3. Write a `decide` function that returns `Result(List(Event), DomainError)`.
 4. Define the command context with event types and tags.
 5. Let a backend load matching facts and protect the append with the returned condition.
+6. React to the committed recorded facts with pure reactors if application effects are needed.
 
 This style keeps Event Sourcing concrete. The important parts are plain Gleam
-functions and types, while storage backends handle persistence, codecs, and
-append guarantees.
+functions and types, while storage backends handle persistence, codecs, append
+guarantees, and the committed records that application code may react to.

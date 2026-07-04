@@ -25,13 +25,35 @@ context-stability guarantee.
 is the intended consistency boundary. It is an implementation strategy, not the
 definition of Event Sourcing.
 
+Both dispatch functions return `factos_pog.Dispatch(event)`: the append metadata
+plus the committed `factos.Recorded(event)` values for that dispatch. Application
+code can feed those records into `factos.Reactor` values after the transaction
+has accepted the facts.
+
 ## Usage
 
-Start a `pog` pool in your application supervision tree, run `migrate`, build a codec with `factos_pog.codec`, then call `dispatch_with_query` or `dispatch` with your domain decider and command.
+Start a `pog` pool in your application supervision tree, run `migrate`, build a
+codec with `factos_pog.codec`, then call `dispatch_with_query` or `dispatch` with
+your domain decider and command.
 
 ```gleam
 let connection = pog.named_connection(pool_name)
 let assert Ok(Nil) = factos_pog.migrate(connection)
+
+let assert Ok(dispatch) =
+  factos_pog.dispatch_with_query(
+    connection,
+    stream: "tickets",
+    query: sale_query(),
+    decider: ticket_decider(),
+    codec: ticket_codec(),
+    command: BuyTicket("renata"),
+  )
+
+let effects = factos.react_all(ticket_reactor(), dispatch.events)
 ```
 
-Your codec owns event serialization. The backend only persists bytes and query metadata.
+Your codec owns event serialization. The backend only persists bytes and query
+metadata. Your application owns any effects returned by reactors: it may run
+them immediately, write them to durable infrastructure, retry them, or ignore
+them during replay.

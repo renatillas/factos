@@ -22,17 +22,19 @@ predefined `User`, `Order`, or `Customer` aggregate stream.
 
 ## Libraries
 
-This repository contains three Gleam libraries:
+This repository contains five Gleam libraries:
 
 1. `factos`: store-independent domain primitives.
-2. `factos_sqlight`: SQLite backend implemented with the `sqlight` package.
-3. `factos_kurrentdb_erlang`: KurrentDB backend for the Erlang target.
+2. `factos_pog`: PostgreSQL backend implemented with the `pog` package.
+3. `factos_sqlight`: SQLite backend implemented with the `sqlight` package.
+4. `factos_kurrentdb_erlang`: KurrentDB backend for the Erlang target.
+5. `factos_cf`: Cloudflare D1 backend for Workers.
 
 The core library is intentionally small. It knows about facts, event types, tags,
-queries, contexts, deciders, views, recorded events, loaded streams, and append
-conditions. It does not know how bytes are encoded, where events are stored, how
-subscriptions work, whether projections are synchronous, or which transport is
-used.
+queries, contexts, deciders, views, reactors, recorded events, loaded streams,
+and append conditions. It does not know how bytes are encoded, where events are
+stored, how effects are executed, whether projections are synchronous, or which
+transport is used.
 
 Backend libraries own storage details. They define storage codecs, persistence
 errors, migrations, and dispatch functions for their storage technology.
@@ -210,7 +212,8 @@ The core library provides:
 4. `AppendCondition` for context-stability requirements.
 5. `Decider` for command-side decisions.
 6. `View` for query-side projection folds.
-7. `Decoded`, `Recorded`, `Context`, and `LoadedStream` records used by backends.
+7. `Reactor` for pure reactions from committed recorded events to application-owned effect values.
+8. `Decoded`, `Recorded`, `Context`, and `LoadedStream` records used by backends.
 
 ### Pure Command Computation
 
@@ -263,9 +266,51 @@ Views can be merged when they consume the same event type:
 let dashboard = factos.merge_views(registrations, display_name_changes)
 ```
 
-Factos intentionally stops at pure projection computation. Materialized view
-storage, catch-up subscriptions, delivery retries, and read-model rebuilds belong
+Factos intentionally stops at pure computation. Materialized view storage,
+catch-up subscriptions, effect delivery retries, and read-model rebuilds belong
 to application or backend-specific code.
+
+### Reactor Computation
+
+`Reactor` is the side-effect-side equivalent of a view. It inspects committed
+`Recorded(event)` values and returns application-owned effect values. It does not
+execute IO.
+
+```gleam
+pub type Effect {
+  SendWelcomeEmail(to: String, event_id: String)
+}
+
+let user_reactor =
+  factos.reactor(fn(recorded) {
+    case recorded.event {
+      UserRegistered(username) -> [
+        SendWelcomeEmail(to: username, event_id: recorded.id),
+      ]
+      UsernameReserved(_) -> []
+      DisplayNameChanged(_, _) -> []
+    }
+  })
+```
+
+Backend dispatch functions return the committed `Recorded(event)` values for the
+append, so applications can react only after the facts were accepted:
+
+```gleam
+let assert Ok(dispatch) =
+  factos_sqlight.dispatch_stream(
+    connection,
+    stream: "user-renata",
+    decider: registration_decider(),
+    codec: codec(),
+    command: RegisterUser("renata"),
+  )
+
+let effects = factos.react_all(user_reactor, dispatch.events)
+```
+
+Effect execution remains outside `factos`: applications can run effects
+immediately, persist them durably, retry them, or ignore them during replay.
 
 ## SQLite Backend: `factos_sqlight`
 
@@ -447,8 +492,8 @@ need a write path that can atomically enforce that context condition.
 
 ## Example
 
-The `examples/src/order_workflow.gleam` file contains a restaurant order workflow
-using `factos_sqlight`. It demonstrates:
+The `examples/orders_sqlight/src/order_workflow.gleam` file contains a restaurant
+order workflow using `factos_sqlight`. It demonstrates:
 
 1. domain commands and events,
 2. a custom state machine,
@@ -457,10 +502,21 @@ using `factos_sqlight`. It demonstrates:
 5. application-owned encoding and decoding, and
 6. a projection view for kitchen summary data.
 
-Run it from the examples package:
+The `examples/tickets_pog/src/tickets_pog.gleam` file contains a concurrent
+ticket-sale workflow using `factos_pog`. It demonstrates:
+
+1. query-based command context consistency,
+2. concurrent buyers racing against a shared capacity rule,
+3. dispatch returning committed recorded events, and
+4. a pure reactor that turns accepted ticket-sale facts into application effects.
+
+Run each example from its package:
 
 ```sh
-cd examples
+cd examples/orders_sqlight
+gleam run
+
+cd ../tickets_pog
 gleam run
 ```
 
