@@ -1,5 +1,5 @@
 name = "factos_pog"
-version = "1.0.0"
+version = "1.1.0"
 description = "PostgreSQL backend for Factos context-first Event Sourcing using pog."
 licences = ["MIT"]
 links = [
