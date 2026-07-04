@@ -360,7 +360,7 @@ fn dispatch_with_retry(
   command: Command,
   attempts attempts: Int,
 ) -> Result(
-  factos_sqlight.Append,
+  factos_sqlight.Dispatch(Event),
   factos_sqlight.Error(DomainError, DecodeError),
 ) {
   let result = dispatch(connection, order_id, command)
@@ -411,7 +411,7 @@ fn dispatch(
   order_id: String,
   command: Command,
 ) -> Result(
-  factos_sqlight.Append,
+  factos_sqlight.Dispatch(Event),
   factos_sqlight.Error(DomainError, DecodeError),
 ) {
   factos_sqlight.dispatch_stream(

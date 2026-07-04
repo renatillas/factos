@@ -123,6 +123,16 @@ pub type View(state, event) {
   View(initial: state, evolve: fn(state, event) -> state)
 }
 
+pub type Reactor(event, effect) {
+  /// A pure event reaction.
+  ///
+  /// Reactors inspect committed recorded events and produce application-owned
+  /// effect values. They do not run IO. Applications or backend adapters decide
+  /// whether to execute effects immediately, persist them durably, retry them, or
+  /// ignore them during replay.
+  Reactor(react: fn(Recorded(event)) -> List(effect))
+}
+
 pub type Revision {
   /// A stream has no events.
   NoEvents
@@ -277,6 +287,17 @@ pub fn view(
   View(initial:, evolve:)
 }
 
+/// Build a pure event reactor.
+///
+/// Reactors are the side-effect planning counterpart to views: they consume
+/// committed recorded events and return application-owned effect values without
+/// executing IO.
+pub fn reactor(
+  react react: fn(Recorded(event)) -> List(effect),
+) -> Reactor(event, effect) {
+  Reactor(react:)
+}
+
 /// Fold events with a decider and decide which new events a command produces.
 ///
 /// This is useful for unit tests and for in-memory command handling. It does not
@@ -339,6 +360,36 @@ pub fn project_from(
 ) -> state {
   let View(_, evolve) = view
   fold_events(state, events, evolve)
+}
+
+/// Produce effect values for one committed recorded event.
+pub fn react(
+  reactor reactor: Reactor(event, effect),
+  event event: Recorded(event),
+) -> List(effect) {
+  let Reactor(react) = reactor
+  react(event)
+}
+
+/// Produce effect values for committed recorded events, preserving event order.
+pub fn react_all(
+  reactor reactor: Reactor(event, effect),
+  events events: List(Recorded(event)),
+) -> List(effect) {
+  use event <- list.flat_map(events)
+  react(reactor, event)
+}
+
+/// Merge two reactors that consume the same event type.
+///
+/// The resulting reactor runs both reactors for each event and concatenates their
+/// produced effects in argument order.
+pub fn merge_reactors(
+  first first: Reactor(event, effect),
+  second second: Reactor(event, effect),
+) -> Reactor(event, effect) {
+  use event <- Reactor
+  list.append(react(first, event), react(second, event))
 }
 
 /// Merge two views that consume the same event type.

@@ -199,6 +199,82 @@ pub fn merge_views_projects_same_events_into_tuple_state_test() {
     == #(1, 2)
 }
 
+pub fn react_maps_one_recorded_event_into_effect_values_test() -> Nil {
+  let event =
+    recorded(UserRegistered("renata"), [factos.tag("username:renata")], revision: 5)
+  let reactor =
+    factos.reactor(react: fn(recorded) {
+      case recorded.event {
+        UserRegistered(username) -> [
+          recorded.id <> ":" <> int.to_string(recorded.revision) <> ":" <> username,
+        ]
+        UsernameReserved(_) -> []
+        DisplayNameChanged(_) -> []
+      }
+    })
+
+  assert factos.react(reactor: reactor, event: event)
+    == ["event-5:5:renata"]
+}
+
+pub fn react_all_flattens_reactions_in_recorded_event_order_test() -> Nil {
+  let reactor =
+    factos.reactor(react: fn(recorded) {
+      case recorded.event {
+        UserRegistered(username) -> [
+          "registered:" <> username,
+          "welcome:" <> username,
+        ]
+        UsernameReserved(_) -> []
+        DisplayNameChanged(name) -> ["display:" <> name]
+      }
+    })
+
+  assert factos.react_all(reactor: reactor, events: [
+      recorded(UserRegistered("renata"), [], revision: 0),
+      recorded(UsernameReserved("renata"), [], revision: 1),
+      recorded(DisplayNameChanged("Rena"), [], revision: 2),
+      recorded(UserRegistered("lucy"), [], revision: 3),
+    ])
+    == [
+      "registered:renata",
+      "welcome:renata",
+      "display:Rena",
+      "registered:lucy",
+      "welcome:lucy",
+    ]
+}
+
+pub fn merge_reactors_combines_outputs_for_the_same_recorded_event_test() -> Nil {
+  let event =
+    recorded(UserRegistered("renata"), [factos.tag("username:renata")], revision: 7)
+  let audit =
+    factos.reactor(react: fn(recorded) {
+      case recorded.event {
+        UserRegistered(username) -> [
+          "audit:" <> recorded.id <> ":" <> username,
+        ]
+        UsernameReserved(_) -> []
+        DisplayNameChanged(_) -> []
+      }
+    })
+  let notification =
+    factos.reactor(react: fn(recorded) {
+      case recorded.event {
+        UserRegistered(username) -> [
+          "notify:" <> int.to_string(recorded.revision) <> ":" <> username,
+        ]
+        UsernameReserved(_) -> []
+        DisplayNameChanged(_) -> []
+      }
+    })
+
+  let merged = factos.merge_reactors(audit, notification)
+
+  assert factos.react(reactor: merged, event: event)
+    == ["audit:event-7:renata", "notify:7:renata"]
+}
+
 fn evolve(state: State, event: Event) -> State {
   case state, event {
     UsernameAvailable, UsernameReserved(_) -> UsernameTaken

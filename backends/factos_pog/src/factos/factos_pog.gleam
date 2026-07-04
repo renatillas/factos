@@ -63,12 +63,9 @@ pub type EventCodec(event) {
   /// `encode` converts a domain event into bytes and metadata. `decode` converts a
   /// stored row back into a `factos.Decoded` domain event. Decode failures are kept
   /// in the application's own error type and wrapped as `DecodeError`.
-  /// `side_effects` run after a successful append and receive the exact domain
-  /// events that were just persisted.
   EventCodec(
     encode: fn(event) -> Proposed(event),
     decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
-    side_effects: List(fn(List(event)) -> Nil),
   )
 }
 
@@ -79,6 +76,15 @@ pub type Append {
   /// append. `position` is the global position of the last inserted event, or
   /// `NoPosition` when no events were produced.
   Append(current_revision: Int, position: factos.SequencePosition)
+}
+
+pub type Dispatch(event) {
+  /// Result of a successful dispatch.
+  ///
+  /// `append` has the stream revision and final global position. `events` are the
+  /// committed events recorded by this dispatch, suitable for pure Factos
+  /// reactors or backend-specific durable effect adapters.
+  Dispatch(append: Append, events: List(factos.Recorded(event)))
 }
 
 pub type Error(domain_error) {
@@ -112,14 +118,11 @@ type QueryParameter {
 /// `encode` turns a domain event into a `Proposed` event ready for persistence.
 /// `decode` turns a stored row back into a domain event. Decode failures are
 /// returned as `DecodeError` and stop load/read flows rather than panicking.
-/// `side_effects` run after a successful append. They are outside the database
-/// transaction; use an outbox table if the effect must be retried.
 pub fn codec(
   encode encode: fn(event) -> Proposed(event),
   decode decode: fn(StoredEvent) -> Result(factos.Decoded(event), DecodeError),
-  side_effects side_effects: List(fn(List(event)) -> Nil),
 ) -> EventCodec(event) {
-  EventCodec(encode:, decode:, side_effects:)
+  EventCodec(encode:, decode:)
 }
 
 /// The schema is an append-only `factos_events` table with a global identity
@@ -197,28 +200,6 @@ pub fn migrate(connection: pog.Connection) -> Result(Nil, Error(_)) {
     on conflict do nothing
     ",
   ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create table if not exists event_outbox (
-      id bigint generated always as identity primary key,
-      stream text not null,
-      event_type text not null,
-      payload text not null,
-      status text not null default 'pending',
-      error text,
-      created_at bigint not null default extract(epoch from now())::bigint,
-      processed_at bigint
-    )
-    ",
-  ))
-  use _ <- result.try(execute_migration(
-    connection,
-    "
-    create index if not exists event_outbox_status_id
-      on event_outbox(status, id)
-    ",
-  ))
   Ok(Nil)
 }
 
@@ -280,7 +261,7 @@ pub fn dispatch_with_query(
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event),
   command command: command,
-) -> Result(Append, Error(domain_error)) {
+) -> Result(Dispatch(event), Error(domain_error)) {
   use transaction_connection <- run_locked_transaction(connection)
   use context <- result.try(read_context(
     transaction_connection,
@@ -294,15 +275,13 @@ pub fn dispatch_with_query(
   )
   let #(context, events) = pair
 
-  use append <- result.try(append_with_condition(
+  append_with_condition(
     transaction_connection,
     stream_name,
     events,
     codec,
     context.append_condition,
-  ))
-  run_side_effects(codec, events)
-  Ok(append)
+  )
 }
 
 /// Load and fold one stream.
@@ -335,14 +314,14 @@ pub fn load_stream(
 ///
 /// Use this when one stream is intentionally the consistency boundary. It remains
 /// useful, but it is not required by Event Sourcing. For command-specific rules,
-/// prefer `dispatch_context` so the protected boundary follows the decision.
+/// prefer `dispatch_with_query` so the protected boundary follows the decision.
 pub fn dispatch(
   connection: pog.Connection,
   stream stream_name: String,
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event),
   command command: command,
-) -> Result(Append, Error(domain_error)) {
+) -> Result(Dispatch(event), Error(domain_error)) {
   use transaction_connection <- run_locked_transaction(connection)
   use loaded <- result.try(load_stream(
     transaction_connection,
@@ -356,27 +335,19 @@ pub fn dispatch(
     |> result.map_error(DomainError),
   )
 
-  use append <- result.try(append_stream_events(
+  append_stream_events(
     transaction_connection,
     stream_name,
     events,
     codec,
     loaded.revision,
-  ))
-  run_side_effects(codec, events)
-  Ok(append)
-}
-
-fn run_side_effects(codec: EventCodec(event), events: List(event)) -> Nil {
-  let EventCodec(_, _, side_effects) = codec
-  use side_effect <- list.each(side_effects)
-  side_effect(events)
+  )
 }
 
 fn run_locked_transaction(
   connection: pog.Connection,
-  work: fn(pog.Connection) -> Result(Append, Error(domain_error)),
-) -> Result(Append, Error(domain_error)) {
+  work: fn(pog.Connection) -> Result(Dispatch(event), Error(domain_error)),
+) -> Result(Dispatch(event), Error(domain_error)) {
   case
     {
       use transaction_connection <- pog.transaction(connection)
@@ -389,7 +360,7 @@ fn run_locked_transaction(
       work(transaction_connection)
     }
   {
-    Ok(append) -> Ok(append)
+    Ok(dispatch) -> Ok(dispatch)
     Error(pog.TransactionQueryError(error)) -> Error(StoreError(error))
     Error(pog.TransactionRolledBack(error)) -> Error(error)
   }
@@ -401,7 +372,7 @@ fn append_with_condition(
   events: List(event),
   codec: EventCodec(event),
   condition: factos.AppendCondition,
-) -> Result(Append, Error(domain_error)) {
+) -> Result(Dispatch(event), Error(domain_error)) {
   case condition {
     factos.NoAppendCondition ->
       append_current_stream(connection, stream_name, events, codec)
@@ -420,7 +391,7 @@ fn append_current_stream(
   stream_name: String,
   events: List(event),
   codec: EventCodec(event),
-) -> Result(Append, Error(domain_error)) {
+) -> Result(Dispatch(event), Error(domain_error)) {
   use revision <- result.try(
     current_revision(connection, stream_name)
     |> result.map_error(StoreError),
@@ -440,13 +411,15 @@ fn append_stream_events(
   events: List(event),
   codec: EventCodec(event),
   expected: factos.Revision,
-) -> Result(Append, Error(domain_error)) {
+) -> Result(Dispatch(event), Error(domain_error)) {
   case events {
-    [] ->
-      Ok(Append(
+    [] -> {
+      let append = Append(
         current_revision: revision_to_int(expected),
         position: factos.NoPosition,
-      ))
+      )
+      Ok(Dispatch(append:, events: []))
+    }
     [_, ..] -> {
       use current <- result.try(
         current_revision(connection, stream_name)
@@ -462,6 +435,7 @@ fn append_stream_events(
             codec,
             current + 1,
             factos.NoPosition,
+            [],
           )
       }
     }
@@ -475,11 +449,15 @@ fn insert_events(
   codec: EventCodec(event),
   revision: Int,
   position: factos.SequencePosition,
-) -> Result(Append, Error(domain_error)) {
+  recorded_events: List(factos.Recorded(event)),
+) -> Result(Dispatch(event), Error(domain_error)) {
   case events {
-    [] -> Ok(Append(current_revision: revision - 1, position: position))
+    [] -> {
+      let append = Append(current_revision: revision - 1, position: position)
+      Ok(Dispatch(append:, events: list.reverse(recorded_events)))
+    }
     [event, ..rest] -> {
-      let EventCodec(encode, _, _) = codec
+      let EventCodec(encode, _) = codec
       let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
       use returned <- result.try(
         pog.query(
@@ -505,6 +483,17 @@ fn insert_events(
         [position, ..] -> factos.SequencePosition(position)
         [] -> position
       }
+      let recorded = factos.Recorded(
+        id: id,
+        stream: stream_name,
+        revision: revision,
+        position: position,
+        type_: type_,
+        version: version,
+        tags: tags,
+        metadata: metadata,
+        event: event,
+      )
       use _ <- result.try(insert_event_tags(connection, position, tags))
       insert_events(
         connection,
@@ -513,6 +502,7 @@ fn insert_events(
         codec,
         revision + 1,
         position,
+        [recorded, ..recorded_events],
       )
     }
   }
@@ -578,7 +568,7 @@ fn decode_row(
   row: StoredEvent,
   codec: EventCodec(event),
 ) -> Result(factos.Recorded(event), Error(domain_error)) {
-  let EventCodec(_, decode_event, _) = codec
+  let EventCodec(_, decode_event) = codec
   use decoded <- result.try(decode_event(row) |> result.map_error(DecodeError))
   let factos.Decoded(event, type_, version, tags, metadata) = decoded
   let StoredEvent(position, id, stream, revision, _, _, _, _, _) = row

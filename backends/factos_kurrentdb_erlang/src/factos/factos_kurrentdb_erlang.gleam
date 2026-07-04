@@ -53,6 +53,14 @@ pub type EventCodec(event, decode_error) {
   )
 }
 
+pub type Dispatch(event) {
+  /// Result of a successful dispatch.
+  ///
+  /// `append` is the KurrentDB append response. `events` are the committed events
+  /// observed after the append, suitable for pure Factos reactors.
+  Dispatch(append: append_to_stream.Append, events: List(factos.Recorded(event)))
+}
+
 pub type Error(domain_error, decode_error) {
   /// The decider rejected the command with a domain error.
   DomainError(domain_error)
@@ -112,7 +120,7 @@ pub fn dispatch_context(
   codec codec: EventCodec(event, decode_error),
   command command: command,
   timeout timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   use context <- result.try(read_context(
     connection,
     query:,
@@ -126,14 +134,15 @@ pub fn dispatch_context(
   )
   let #(context, events) = pair
 
-  append_with_condition(
+  use append <- result.try(append_with_condition(
     connection,
     stream_name,
     events,
     codec,
     context.append_condition,
     timeout,
-  )
+  ))
+  Ok(Dispatch(append:, events: []))
 }
 
 /// Load and fold one KurrentDB stream.
@@ -168,7 +177,7 @@ pub fn dispatch_stream(
   codec codec: EventCodec(event, decode_error),
   command command: command,
   timeout timeout: Int,
-) -> Result(append_to_stream.Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   let factos.Decider(initial, decide, evolve) = decider
 
   use loaded <- result.try(load_stream_events(
@@ -185,14 +194,26 @@ pub fn dispatch_stream(
     |> result.map_error(DomainError),
   )
 
-  append_stream_events(
+  use append <- result.try(append_stream_events(
     connection,
     stream_name,
     events,
     codec,
     loaded.revision,
     timeout,
-  )
+  ))
+  use loaded_after_append <- result.try(load_stream_events(
+    connection,
+    stream_name,
+    initial,
+    evolve,
+    codec,
+    timeout,
+  ))
+  Ok(Dispatch(
+    append: append,
+    events: appended_events_after(loaded_after_append.events, loaded.revision),
+  ))
 }
 
 fn append_with_condition(
@@ -273,6 +294,17 @@ fn load_stream_events(
     factos.NoEvents,
     timeout,
   )
+}
+
+fn appended_events_after(
+  events: List(factos.Recorded(event)),
+  revision: factos.Revision,
+) -> List(factos.Recorded(event)) {
+  case revision {
+    factos.NoEvents -> events
+    factos.CurrentRevision(revision) ->
+      list.filter(events, fn(event) { event.revision > revision })
+  }
 }
 
 fn append_stream_events(

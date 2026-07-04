@@ -81,6 +81,15 @@ pub type Append {
   Append(current_revision: Int, position: factos.SequencePosition)
 }
 
+pub type Dispatch(event) {
+  /// Result of a successful dispatch.
+  ///
+  /// `append` has the stream revision and final global position. `events` are the
+  /// committed events recorded by this dispatch, suitable for pure Factos
+  /// reactors or backend-specific durable effect adapters.
+  Dispatch(append: Append, events: List(factos.Recorded(event)))
+}
+
 pub type Error(domain_error, decode_error) {
   /// The decider rejected the command with a domain error.
   DomainError(domain_error)
@@ -172,7 +181,7 @@ pub fn dispatch_context(
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, decode_error),
   command command: command,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   use _ <- result.try(
     sqlight.exec("begin immediate", on: connection)
     |> result.map_error(StoreError),
@@ -243,7 +252,7 @@ pub fn dispatch_stream(
   decider decider: factos.Decider(command, state, event, domain_error),
   codec codec: EventCodec(event, decode_error),
   command command: command,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   use _ <- result.try(
     sqlight.exec("begin immediate", on: connection)
     |> result.map_error(StoreError),
@@ -276,12 +285,12 @@ pub fn dispatch_stream(
 
 fn finish_transaction(
   connection: sqlight.Connection,
-  result: Result(Append, Error(domain_error, decode_error)),
-) -> Result(Append, Error(domain_error, decode_error)) {
+  result: Result(Dispatch(event), Error(domain_error, decode_error)),
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   case result {
-    Ok(append) ->
+    Ok(dispatch) ->
       case sqlight.exec("commit", on: connection) {
-        Ok(Nil) -> Ok(append)
+        Ok(Nil) -> Ok(dispatch)
         Error(error) -> Error(StoreError(error))
       }
     Error(error) -> {
@@ -297,7 +306,7 @@ fn append_with_condition(
   events: List(event),
   codec: EventCodec(event, decode_error),
   condition: factos.AppendCondition,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   case condition {
     factos.NoAppendCondition ->
       append_current_stream(connection, stream_name, events, codec)
@@ -316,7 +325,7 @@ fn append_current_stream(
   stream_name: String,
   events: List(event),
   codec: EventCodec(event, decode_error),
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   use revision <- result.try(
     current_revision(connection, stream_name)
     |> result.map_error(StoreError),
@@ -336,13 +345,15 @@ fn append_stream_events(
   events: List(event),
   codec: EventCodec(event, decode_error),
   expected: factos.Revision,
-) -> Result(Append, Error(domain_error, decode_error)) {
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   case events {
-    [] ->
-      Ok(Append(
+    [] -> {
+      let append = Append(
         current_revision: revision_to_int(expected),
         position: factos.NoPosition,
-      ))
+      )
+      Ok(Dispatch(append:, events: []))
+    }
     [_, ..] -> {
       use current <- result.try(
         current_revision(connection, stream_name)
@@ -358,6 +369,7 @@ fn append_stream_events(
             codec,
             current + 1,
             factos.NoPosition,
+            [],
           )
       }
     }
@@ -371,9 +383,13 @@ fn insert_events(
   codec: EventCodec(event, decode_error),
   revision: Int,
   position: factos.SequencePosition,
-) -> Result(Append, Error(domain_error, decode_error)) {
+  recorded_events: List(factos.Recorded(event)),
+) -> Result(Dispatch(event), Error(domain_error, decode_error)) {
   case events {
-    [] -> Ok(Append(current_revision: revision - 1, position: position))
+    [] -> {
+      let append = Append(current_revision: revision - 1, position: position)
+      Ok(Dispatch(append:, events: list.reverse(recorded_events)))
+    }
     [event, ..rest] -> {
       let EventCodec(encode, _) = codec
       let Proposed(id, _, type_, version, tags, metadata, data) = encode(event)
@@ -403,6 +419,17 @@ fn insert_events(
         [position, ..] -> factos.SequencePosition(position)
         [] -> position
       }
+      let recorded = factos.Recorded(
+        id: id,
+        stream: stream_name,
+        revision: revision,
+        position: position,
+        type_: type_,
+        version: version,
+        tags: tags,
+        metadata: metadata,
+        event: event,
+      )
       insert_events(
         connection,
         stream_name,
@@ -410,6 +437,7 @@ fn insert_events(
         codec,
         revision + 1,
         position,
+        [recorded, ..recorded_events],
       )
     }
   }

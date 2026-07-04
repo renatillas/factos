@@ -1,6 +1,5 @@
 import factos
 import factos/factos_pog
-import factos/factos_pog/outbox
 import gleam/bit_array
 import gleam/erlang/process
 import gleam/int
@@ -17,7 +16,6 @@ pub fn main() -> Nil {
 
 type Command {
   RegisterUser(username: String)
-  RegisterUsers(first: String, second: String)
 }
 
 type Event {
@@ -49,15 +47,12 @@ type TestGlobalData {
   TestGlobalData(connection: pog.Connection)
 }
 
-type SideEffectMessage {
-  SideEffect(events: List(Event))
-}
 
 pub fn dispatch_alias_persists_events_test() {
   let TestGlobalData(connection) = global_data()
   reset_schema(connection)
 
-  let assert Ok(factos_pog.Append(current_revision: 0, position: _)) =
+  let assert Ok(dispatch) =
     factos_pog.dispatch(
       connection,
       stream: "user-renata",
@@ -65,6 +60,23 @@ pub fn dispatch_alias_persists_events_test() {
       codec: codec(),
       command: RegisterUser("renata"),
     )
+
+  let assert factos_pog.Append(
+    current_revision: 0,
+    position: factos.SequencePosition(_),
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_user_recorded(
+    recorded,
+    stream: "user-renata",
+    revision: 0,
+    position: dispatch.append.position,
+    username: "renata",
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    UserRegistered("renata"),
+  ]
 
   let assert Ok(loaded) =
     factos_pog.load_stream(
@@ -85,10 +97,7 @@ pub fn dispatch_with_query_filters_before_decoding_unknown_events_test() {
 
   let query = username_query("renata")
 
-  let assert Ok(factos_pog.Append(
-    current_revision: 0,
-    position: factos.SequencePosition(_),
-  )) =
+  let assert Ok(dispatch) =
     factos_pog.dispatch_with_query(
       connection,
       stream: "user-renata",
@@ -97,6 +106,23 @@ pub fn dispatch_with_query_filters_before_decoding_unknown_events_test() {
       codec: codec(),
       command: RegisterUser("renata"),
     )
+
+  let assert factos_pog.Append(
+    current_revision: 0,
+    position: factos.SequencePosition(_),
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_user_recorded(
+    recorded,
+    stream: "user-renata",
+    revision: 0,
+    position: dispatch.append.position,
+    username: "renata",
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    UserRegistered("renata"),
+  ]
 
   let assert Ok(context) =
     factos_pog.read_context(
@@ -112,7 +138,7 @@ pub fn dispatch_with_query_filters_before_decoding_unknown_events_test() {
   assert context.position != factos.NoPosition
 }
 
-pub fn dispatch_context_handles_many_streams_test() {
+pub fn dispatch_with_query_handles_many_streams_test() {
   let TestGlobalData(connection) = global_data()
   reset_schema(connection)
 
@@ -123,10 +149,24 @@ pub fn dispatch_context_handles_many_streams_test() {
       ]),
     ])
 
-  let assert Ok(factos_pog.Append(
+  let assert Ok(dispatch) = dispatch_counter_context_many(connection, query, 25)
+  let assert factos_pog.Append(
     current_revision: 0,
     position: factos.SequencePosition(_),
-  )) = dispatch_counter_context_many(connection, query, 25)
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_counter_recorded(
+    recorded,
+    stream: "counter-context-1",
+    revision: 0,
+    position: dispatch.append.position,
+    value: 25,
+    type_: factos.event_type("Incremented"),
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    Incremented(25),
+  ]
 
   let assert Ok(context) =
     factos_pog.read_context(
@@ -140,68 +180,6 @@ pub fn dispatch_context_handles_many_streams_test() {
   assert list.length(context.events) == 25
 }
 
-pub fn dispatch_alias_runs_side_effect_after_successful_append_test() {
-  let TestGlobalData(connection) = global_data()
-  reset_schema(connection)
-  let side_effect_messages = process.new_subject()
-
-  let assert Ok(append) =
-    factos_pog.dispatch(
-      connection,
-      stream: "user-side-effect",
-      decider: decider(),
-      codec: codec_with_side_effect(fn(events) {
-        process.send(side_effect_messages, SideEffect(events))
-      }),
-      command: RegisterUsers("side-effect-a", "side-effect-b"),
-    )
-
-  let assert Ok(loaded) =
-    factos_pog.load_stream(
-      connection,
-      stream: "user-side-effect",
-      decider: decider(),
-      codec: codec(),
-    )
-  let assert [first, second] = loaded.events
-  let assert Ok(SideEffect(side_effect_events)) =
-    process.receive(side_effect_messages, within: 0)
-
-  assert append.current_revision == 1
-  assert append.position == second.position
-  assert side_effect_events == [first.event, second.event]
-}
-
-pub fn outbox_insert_returns_readable_pending_records_test() {
-  let TestGlobalData(connection) = global_data()
-  reset_schema(connection)
-
-  let assert Ok([first_id, second_id]) =
-    outbox.insert(connection, [
-      outbox.entry(
-        stream: "outbox-stream-1",
-        event_type: "UserRegistered",
-        payload: "renata",
-      ),
-      outbox.entry(
-        stream: "outbox-stream-2",
-        event_type: "UserRegistered",
-        payload: "ada",
-      ),
-    ])
-
-  let assert Ok(Some(first)) = outbox.read_pending_outbox(connection, first_id)
-  let assert Ok(Some(second)) =
-    outbox.read_pending_outbox(connection, second_id)
-
-  assert first.id == first_id
-  assert first.stream == "outbox-stream-1"
-  assert first.event_type == "UserRegistered"
-  assert first.payload == "renata"
-  assert second.id == second_id
-  assert second.stream == "outbox-stream-2"
-  assert second.payload == "ada"
-}
 
 fn global_data() -> TestGlobalData {
   global_value.create_with_unique_name("factos_pog_test.global.data", fn() {
@@ -214,7 +192,7 @@ fn start_test_connection() -> pog.Connection {
   let config =
     pog.default_config(pool_name)
     |> pog.host("127.0.0.1")
-    |> pog.port(5432)
+    |> pog.port(55432)
     |> pog.database("factos_pog")
     |> pog.user("postgres")
     |> pog.password(Some("postgres"))
@@ -226,9 +204,6 @@ fn start_test_connection() -> pog.Connection {
 }
 
 fn reset_schema(connection: pog.Connection) -> Nil {
-  let assert Ok(_) =
-    pog.query("drop table if exists event_outbox")
-    |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("drop table if exists factos_event_tags")
     |> pog.execute(on: connection)
@@ -274,6 +249,24 @@ fn username_query(username: String) -> factos.Query {
   ])
 }
 
+fn assert_user_recorded(
+  recorded: factos.Recorded(Event),
+  stream stream_name: String,
+  revision revision: Int,
+  position position: factos.SequencePosition,
+  username username: String,
+) -> Nil {
+  assert recorded.id == "event-" <> username
+  assert recorded.stream == stream_name
+  assert recorded.revision == revision
+  assert recorded.position == position
+  assert recorded.type_ == factos.event_type("UserRegistered")
+  assert recorded.version == 1
+  assert recorded.tags == [factos.tag("username:" <> username)]
+  assert recorded.metadata == factos.empty_metadata()
+  assert recorded.event == UserRegistered(username)
+}
+
 fn decider() -> factos.Decider(Command, State, Event, DomainError) {
   factos.decider(initial: Available, decide:, evolve:)
 }
@@ -281,13 +274,7 @@ fn decider() -> factos.Decider(Command, State, Event, DomainError) {
 fn decide(state: State, command: Command) -> Result(List(Event), DomainError) {
   case state, command {
     Available, RegisterUser(username) -> Ok([UserRegistered(username)])
-    Available, RegisterUsers(first, second) ->
-      Ok([
-        UserRegistered(first),
-        UserRegistered(second),
-      ])
     Taken, RegisterUser(_) -> Error(AlreadyTaken)
-    Taken, RegisterUsers(_, _) -> Error(AlreadyTaken)
   }
 }
 
@@ -296,13 +283,7 @@ fn evolve(_state: State, _event: Event) -> State {
 }
 
 fn codec() -> factos_pog.EventCodec(Event) {
-  factos_pog.codec(encode:, decode:, side_effects: [])
-}
-
-fn codec_with_side_effect(
-  side_effect: fn(List(Event)) -> Nil,
-) -> factos_pog.EventCodec(Event) {
-  factos_pog.codec(encode:, decode:, side_effects: [side_effect])
+  factos_pog.codec(encode:, decode:)
 }
 
 fn encode(event: Event) -> factos_pog.Proposed(Event) {
@@ -342,7 +323,7 @@ fn dispatch_counter_context_many(
   connection: pog.Connection,
   query: factos.Query,
   remaining: Int,
-) -> Result(factos_pog.Append, factos_pog.Error(Nil)) {
+) -> Result(factos_pog.Dispatch(CounterEvent), factos_pog.Error(Nil)) {
   case remaining {
     0 ->
       factos_pog.dispatch_with_query(
@@ -408,7 +389,6 @@ fn counter_codec() -> factos_pog.EventCodec(CounterEvent) {
   factos_pog.codec(
     encode: encode_counter_event,
     decode: decode_counter_event,
-    side_effects: [],
   )
 }
 
@@ -452,4 +432,23 @@ fn decode_counter_event(
     }
     _ -> Error(factos_pog.UnknownEvent)
   }
+}
+
+fn assert_counter_recorded(
+  recorded: factos.Recorded(CounterEvent),
+  stream stream_name: String,
+  revision revision: Int,
+  position position: factos.SequencePosition,
+  value value: Int,
+  type_ type_: factos.EventType,
+) -> Nil {
+  assert recorded.id == "counter-event-" <> int.to_string(value)
+  assert recorded.stream == stream_name
+  assert recorded.revision == revision
+  assert recorded.position == position
+  assert recorded.type_ == type_
+  assert recorded.version == 1
+  assert recorded.tags == [factos.tag("counter:load")]
+  assert recorded.metadata == factos.empty_metadata()
+  assert recorded.event == Incremented(value)
 }

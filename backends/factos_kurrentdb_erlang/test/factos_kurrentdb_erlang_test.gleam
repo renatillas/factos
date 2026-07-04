@@ -47,8 +47,22 @@ pub fn dispatch_stream_handles_many_events_integration_test() {
   let stream_name = unique_name("counter-stream")
   let event_type = unique_name("FactosCounterIncremented")
 
-  let assert Ok(append_to_stream.Append(current_revision: 99, position: _)) =
+  let assert Ok(dispatch) =
     dispatch_counter_stream_many(stream_name, event_type, 100)
+  let assert append_to_stream.Append(current_revision: 99, position: _) =
+    dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_counter_recorded(
+    recorded,
+    stream: stream_name,
+    revision: 99,
+    value: 100,
+    type_: factos.event_type(event_type),
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    Incremented(100),
+  ]
 
   let assert Ok(loaded) =
     factos_kurrentdb_erlang.load_stream(
@@ -73,8 +87,22 @@ pub fn read_context_handles_many_streams_integration_test() {
       ]),
     ])
 
-  let assert Ok(append_to_stream.Append(current_revision: 0, position: _)) =
+  let assert Ok(dispatch) =
     dispatch_counter_context_streams_many(event_type, 50)
+  let assert append_to_stream.Append(current_revision: 0, position: _) =
+    dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_counter_recorded(
+    recorded,
+    stream: event_type <> "-counter-context-1",
+    revision: 0,
+    value: 1,
+    type_: factos.event_type(event_type),
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    Incremented(1),
+  ]
 
   let assert Ok(context) =
     factos_kurrentdb_erlang.read_context(
@@ -112,7 +140,7 @@ fn dispatch_counter_stream_many(
   event_type: String,
   remaining: Int,
 ) -> Result(
-  append_to_stream.Append,
+  factos_kurrentdb_erlang.Dispatch(CounterEvent),
   factos_kurrentdb_erlang.Error(Nil, DecodeError),
 ) {
   let result =
@@ -137,13 +165,13 @@ fn dispatch_counter_context_streams_many(
   event_type: String,
   remaining: Int,
 ) -> Result(
-  append_to_stream.Append,
+  factos_kurrentdb_erlang.Dispatch(CounterEvent),
   factos_kurrentdb_erlang.Error(Nil, DecodeError),
 ) {
   let result =
     factos_kurrentdb_erlang.dispatch_stream(
       connection(),
-      stream: unique_name("counter-context"),
+      stream: event_type <> "-counter-context-" <> int.to_string(remaining),
       decider: counter_decider(),
       codec: counter_codec(event_type),
       command: Increment,
@@ -241,6 +269,23 @@ fn decode_counter_event(
     }
     Ok(_) | Error(_) -> Error(UnknownEvent)
   }
+}
+
+fn assert_counter_recorded(
+  recorded: factos.Recorded(CounterEvent),
+  stream stream_name: String,
+  revision revision: Int,
+  value value: Int,
+  type_ type_: factos.EventType,
+) -> Nil {
+  assert recorded.stream == stream_name
+  assert recorded.revision == revision
+  assert recorded.position != factos.NoPosition
+  assert recorded.type_ == type_
+  assert recorded.version == 1
+  assert recorded.tags == [factos.tag("counter:load")]
+  assert recorded.metadata == factos.empty_metadata()
+  assert recorded.event == Incremented(value)
 }
 
 fn unique_name(prefix: String) -> String {

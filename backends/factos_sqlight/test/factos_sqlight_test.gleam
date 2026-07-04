@@ -49,7 +49,7 @@ pub fn dispatch_stream_persists_events_test() {
   use connection <- sqlight.with_connection(":memory:")
   let assert Ok(Nil) = factos_sqlight.migrate(connection)
 
-  let assert Ok(factos_sqlight.Append(current_revision: 0, position: _)) =
+  let assert Ok(dispatch) =
     factos_sqlight.dispatch_stream(
       connection,
       stream: "user-renata",
@@ -57,6 +57,23 @@ pub fn dispatch_stream_persists_events_test() {
       codec: codec(),
       command: RegisterUser("renata"),
     )
+
+  let assert factos_sqlight.Append(
+    current_revision: 0,
+    position: factos.SequencePosition(_),
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_user_recorded(
+    recorded,
+    stream: "user-renata",
+    revision: 0,
+    position: dispatch.append.position,
+    username: "renata",
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    UserRegistered("renata"),
+  ]
 
   let assert Ok(loaded) =
     factos_sqlight.load_stream(
@@ -74,10 +91,23 @@ pub fn dispatch_stream_handles_many_events_test() {
   use connection <- sqlight.with_connection(":memory:")
   let assert Ok(Nil) = factos_sqlight.migrate(connection)
 
-  let assert Ok(factos_sqlight.Append(
+  let assert Ok(dispatch) = dispatch_counter_stream_many(connection, 250)
+  let assert factos_sqlight.Append(
     current_revision: 249,
     position: factos.SequencePosition(_),
-  )) = dispatch_counter_stream_many(connection, 250)
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_counter_recorded(
+    recorded,
+    stream: "counter-load",
+    revision: 249,
+    position: dispatch.append.position,
+    value: 250,
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    Incremented(250),
+  ]
 
   let assert Ok(loaded) =
     factos_sqlight.load_stream(
@@ -103,10 +133,23 @@ pub fn dispatch_context_handles_many_streams_test() {
       ]),
     ])
 
-  let assert Ok(factos_sqlight.Append(
+  let assert Ok(dispatch) = dispatch_counter_context_many(connection, query, 100)
+  let assert factos_sqlight.Append(
     current_revision: 0,
     position: factos.SequencePosition(_),
-  )) = dispatch_counter_context_many(connection, query, 100)
+  ) = dispatch.append
+  let assert [recorded] = dispatch.events
+  assert_counter_recorded(
+    recorded,
+    stream: "counter-context-1",
+    revision: 0,
+    position: dispatch.append.position,
+    value: 100,
+  )
+  let reactor = factos.reactor(react: fn(recorded) { [recorded.event] })
+  assert factos.react_all(reactor: reactor, events: dispatch.events) == [
+    Incremented(100),
+  ]
 
   let assert Ok(context) =
     factos_sqlight.read_context(
@@ -173,10 +216,28 @@ fn decode(
   }
 }
 
+fn assert_user_recorded(
+  recorded: factos.Recorded(Event),
+  stream stream_name: String,
+  revision revision: Int,
+  position position: factos.SequencePosition,
+  username username: String,
+) -> Nil {
+  assert recorded.id == "event-" <> username
+  assert recorded.stream == stream_name
+  assert recorded.revision == revision
+  assert recorded.position == position
+  assert recorded.type_ == factos.event_type("UserRegistered")
+  assert recorded.version == 1
+  assert recorded.tags == [factos.tag("username:" <> username)]
+  assert recorded.metadata == factos.empty_metadata()
+  assert recorded.event == UserRegistered(username)
+}
+
 fn dispatch_counter_stream_many(
   connection: sqlight.Connection,
   remaining: Int,
-) -> Result(factos_sqlight.Append, factos_sqlight.Error(Nil, DecodeError)) {
+) -> Result(factos_sqlight.Dispatch(CounterEvent), factos_sqlight.Error(Nil, DecodeError)) {
   case remaining {
     0 ->
       factos_sqlight.dispatch_stream(
@@ -208,7 +269,7 @@ fn dispatch_counter_context_many(
   connection: sqlight.Connection,
   query: factos.Query,
   remaining: Int,
-) -> Result(factos_sqlight.Append, factos_sqlight.Error(Nil, DecodeError)) {
+) -> Result(factos_sqlight.Dispatch(CounterEvent), factos_sqlight.Error(Nil, DecodeError)) {
   case remaining {
     0 ->
       factos_sqlight.dispatch_context(
@@ -317,4 +378,22 @@ fn decode_counter_event(
     }
     _ -> Error(UnknownEvent)
   }
+}
+
+fn assert_counter_recorded(
+  recorded: factos.Recorded(CounterEvent),
+  stream stream_name: String,
+  revision revision: Int,
+  position position: factos.SequencePosition,
+  value value: Int,
+) -> Nil {
+  assert recorded.id == "counter-event-" <> int.to_string(value)
+  assert recorded.stream == stream_name
+  assert recorded.revision == revision
+  assert recorded.position == position
+  assert recorded.type_ == factos.event_type("Incremented")
+  assert recorded.version == 1
+  assert recorded.tags == [factos.tag("counter:load")]
+  assert recorded.metadata == factos.empty_metadata()
+  assert recorded.event == Incremented(value)
 }

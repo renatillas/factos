@@ -1,7 +1,7 @@
 name = "factos"
 version = "1.0.0"
 description = "Store-independent context-first Event Sourcing primitives for Gleam."
-licences = ["Apache-2.0"]
+licences = ["MIT"]
 links = [
   { title = "Simply Event Sourcing", href = "https://ricofritzsche.me/simply-event-sourcing/" },
 ]
