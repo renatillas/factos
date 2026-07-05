@@ -8,7 +8,7 @@ links = [
 ]
 
 [dependencies]
-factos = { path = "../.." }
+factos = { git = "https://github.com/renatillas/factos", ref = "main" } 
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 sqlight = ">= 1.1.0 and < 2.0.0"
 

@@ -9,7 +9,7 @@ links = [
 ]
 
 [dependencies]
-factos = { path = "../.." }
+factos = { git = "https://github.com/renatillas/factos", ref = "main" } 
 cf = { path = "../../../cf" }
 gleam_javascript = ">= 1.0.0 and < 2.0.0"
 gleam_stdlib = ">= 1.0.0 and < 2.0.0"
